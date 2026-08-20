@@ -1,0 +1,38 @@
+[Unit]
+Description=Configuracion de primer arranque (Docker + Coolify + Cloudflare Tunnel)
+After=network-online.target
+Wants=network-online.target
+# Toma la consola en exclusiva para que el asistente no compita con el login.
+# Se enumeran las getty habituales: tty1 con monitor, ttyS0/ttyAMA0 por serie.
+#
+# Hay Conflicts pero NO Before, y es deliberado. Con Before, las getty tienen
+# que esperar a que el asistente termine; si el asistente se queda colgado (por
+# ejemplo esperando a network-online.target en una maquina sin red), el equipo
+# se queda sin ninguna consola de login y sin forma de entrar a arreglarlo.
+# Comprobado en VM. Que la getty pueda arrancar antes es un mal menor: cuando
+# el asistente arranca, Conflicts la para y toma la consola igualmente.
+Conflicts=getty@tty1.service serial-getty@ttyS0.service serial-getty@ttyAMA0.service
+ConditionPathExists=!/var/lib/coolify-setup/completed
+
+[Service]
+Type=oneshot
+# El token viaja por entorno, no por linea de comandos: asi no queda visible
+# en 'ps'. El guion '-' hace opcional el fichero.
+EnvironmentFile=-/etc/coolify-setup.env
+ExecStart=/usr/local/sbin/coolify-setup.sh
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+# /dev/console, no /dev/tty1: apunta a la consola que el kernel tenga
+# configurada. Con monitor es la pantalla; en un equipo headless por puerto
+# serie (o en una VM) es la serie. Fijar tty1 dejaba el asistente en una
+# consola que nadie ve. Comprobado en VM.
+TTYPath=/dev/console
+TTYReset=yes
+TTYVHangup=yes
+RemainAfterExit=no
+# El asistente es interactivo: puede tardar lo que el usuario tarde en leer.
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

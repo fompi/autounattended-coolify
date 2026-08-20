@@ -15,6 +15,7 @@ set -eu
 
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 TPL="$HERE/cloud-init/user-data.tpl"
+UNIT="$HERE/cloud-init/coolify-setup.service"
 SETUP="$HERE/setup.sh"
 OUT="$HERE/cloud-init"
 KEYBOARD=es
@@ -90,6 +91,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -r "$TPL" ]   || die "Falta la plantilla $TPL"
+[ -r "$UNIT" ]  || die "Falta la unidad systemd $UNIT"
 [ -r "$SETUP" ] || die "Falta $SETUP"
 mkdir -p "$OUT"
 
@@ -98,50 +100,22 @@ sh -n "$SETUP" || die "setup.sh no pasa la comprobacion de sintaxis; no se gener
 TMP=$(mktemp -d) || die "No se pudo crear un directorio temporal"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-# --- Bloque opcional con el token, como entrada extra de write_files --------
-if [ -n "$SSH_KEY" ]; then
-    case "$SSH_KEY" in
-        ssh-ed25519*|ssh-rsa*|ecdsa-sha2*) : ;;
-        *) die "Eso no parece una clave publica SSH: ${SSH_KEY%% *}" ;;
-    esac
-    PASSTHRU="$PASSTHRU --ssh-key=@/etc/coolify-setup.pub"
-fi
-
-if [ -n "$CF_TOKEN" ] || [ -n "$PASSTHRU" ]; then
-    {
-        printf '\n'
-        printf "      - path: /etc/coolify-setup.env\n"
-        printf "        owner: root:root\n"
-        printf "        permissions: '0600'\n"
-        printf "        content: |\n"
-        [ -n "$CF_TOKEN" ] && printf "          CF_API_TOKEN=%s\n" "$CF_TOKEN"
-        [ -n "$PASSTHRU" ] && printf "          SETUP_EXTRA_ARGS=%s\n" "$PASSTHRU"
-        if [ -n "$SSH_KEY" ]; then
-            printf '\n'
-            printf "      - path: /etc/coolify-setup.pub\n"
-            printf "        owner: root:root\n"
-            printf "        permissions: '0644'\n"
-            printf "        content: |\n"
-            printf "          %s\n" "$SSH_KEY"
-        fi
-    } > "$TMP/envblock"
-else
-    : > "$TMP/envblock"
-fi
 
 # --- Ensamblado --------------------------------------------------------------
 # El script se indenta 10 espacios para caber en el escalar literal de YAML.
 sed 's/^/          /' "$SETUP" > "$TMP/setup.indented"
+sed 's/^/          /' "$UNIT"  > "$TMP/unit.indented"
 
-SETUP_FILE="$TMP/setup.indented" ENV_FILE="$TMP/envblock" \
+SETUP_FILE="$TMP/setup.indented" UNIT_FILE="$TMP/unit.indented" ENV_FILE="$TMP/envblock" \
 awk -v kbd="$KEYBOARD" '
     $0 == "__SETUP_SH__"  { while ((getline l < ENVIRON["SETUP_FILE"]) > 0) print l; next }
+    $0 == "__UNIT_FILE__" { while ((getline l < ENVIRON["UNIT_FILE"])  > 0) print l; next }
     $0 == "__ENV_FILE__"  { while ((getline l < ENVIRON["ENV_FILE"])   > 0) print l; next }
     { gsub(/__KEYBOARD__/, kbd); print }
 ' "$TPL" > "$TMP/user-data"
 
-grep -q '__SETUP_SH__\|__ENV_FILE__\|__KEYBOARD__' "$TMP/user-data" \
-    && die "Quedaron marcadores sin sustituir en user-data"
+grep -q '__SETUP_SH__\|__UNIT_FILE__\|__ENV_FILE__\|__KEYBOARD__' \
+    "$TMP/user-data" && die "Quedaron marcadores sin sustituir en user-data"
 
 printf 'instance-id: coolify-minipc-%s\nlocal-hostname: ubuntu-tmp\n' \
     "$(date +%Y%m%d%H%M%S)" > "$TMP/meta-data"
@@ -208,8 +182,21 @@ if [ -n "$ISO_IN" ]; then
     [ -e "$ISO_OUT" ] && { printf '  (sobrescribiendo %s)\n' "$ISO_OUT"; rm -f "$ISO_OUT"; }
 
     printf '\nReempaquetando %s -> %s\n' "$ISO_IN" "$ISO_OUT"
+    # /cidata lleva, ademas del seed de cloud-init, los ficheros que
+    # late-commands copia a /target durante la instalacion. Ese es el camino
+    # principal: no depende del cloud-init del sistema destino (incidencia #1).
     mkdir -p "$TMP/cidata"
     cp "$OUT/user-data" "$OUT/meta-data" "$TMP/cidata/"
+    install -m 0755 "$SETUP" "$TMP/cidata/coolify-setup.sh"
+    install -m 0644 "$UNIT"  "$TMP/cidata/coolify-setup.service"
+    if [ -n "$CF_TOKEN" ] || [ -n "$PASSTHRU" ]; then
+        umask 077
+        : > "$TMP/cidata/coolify-setup.env"
+        [ -n "$CF_TOKEN" ] && printf 'CF_API_TOKEN=%s\n' "$CF_TOKEN" >> "$TMP/cidata/coolify-setup.env"
+        [ -n "$PASSTHRU" ] && printf 'SETUP_EXTRA_ARGS=%s\n' "$PASSTHRU" >> "$TMP/cidata/coolify-setup.env"
+        umask 022
+    fi
+    [ -n "$SSH_KEY" ] && printf '%s\n' "$SSH_KEY" > "$TMP/cidata/coolify-setup.pub"
 
     xorriso -osirrox on -indev "$ISO_IN" -extract /boot/grub/grub.cfg "$TMP/grub.cfg" 2>/dev/null \
         || die "La ISO no tiene /boot/grub/grub.cfg; no parece una Ubuntu Server reciente."
@@ -249,9 +236,11 @@ if [ -n "$ISO_IN" ]; then
     xorriso -osirrox on -indev "$ISO_OUT" -extract /boot/grub/grub.cfg "$TMP/verify.cfg" 2>/dev/null
     grep -q 'autoinstall ds=nocloud' "$TMP/verify.cfg" \
         || die "La ISO generada no contiene los parametros de arranque esperados."
-    xorriso -indev "$ISO_OUT" -lsl /cidata 2>/dev/null | grep -q 'user-data' \
-        || die "La ISO generada no contiene /cidata/user-data."
-    printf '  verificado: parametros de arranque y /cidata presentes en la ISO\n'
+    for f in user-data coolify-setup.sh coolify-setup.service; do
+        xorriso -indev "$ISO_OUT" -lsl /cidata 2>/dev/null | grep -q "$f" \
+            || die "La ISO generada no contiene /cidata/$f."
+    done
+    printf '  verificado: parametros de arranque y /cidata completo en la ISO\n'
 
     cat <<EOF
 
