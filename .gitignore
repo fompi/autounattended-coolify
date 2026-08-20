@@ -1,0 +1,13 @@
+# Artefactos generados por build-usb.sh.
+# user-data se genera a partir de la plantilla e INCRUSTA el token de
+# Cloudflare cuando se usa --cf-token: nunca debe entrar en el repositorio.
+/cloud-init/user-data
+/cloud-init/meta-data
+
+# ISOs reempaquetadas (varios GB, y pueden llevar el token dentro).
+*.iso
+
+# Claves y tokens que se dejen sueltos al construir.
+*.pub
+*token*
+!**/*.md
