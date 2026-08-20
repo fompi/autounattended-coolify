@@ -17,7 +17,9 @@ de Cloudflare**.
 | Instalación de Ubuntu sin intervención | Funciona. Verificado en VM. |
 | Arranque del asistente en el primer boot | Funciona. Verificado en VM. |
 | Hostname, zona horaria, usuario, SSH, Docker | Funciona. Verificado en VM. |
-| Coolify, túnel y DNS | Verificado contra una API de Cloudflare **simulada**, no contra la real. |
+| Coolify y registro de su primer usuario | Funciona. Verificado en VM. |
+| Túnel, reglas de enrutado y registros DNS | Funciona contra una API de Cloudflare **simulada**, no contra la real. |
+| Arranque del servicio `cloudflared` | Sin verificar: necesita un túnel real de Cloudflare. |
 
 Lo único que no se ha ejercitado contra servicios reales es la parte final:
 las llamadas a Cloudflare se probaron contra un simulador que imita sus
@@ -295,6 +297,15 @@ Probado ejecutándolo, no solo leyéndolo.
   29.7.2 instalado y respondiendo.
 - Las llamadas a Cloudflare salen del sistema instalado y llegan al simulador:
   verificación del token, resolución de la zona y consulta de la cuenta.
+- Coolify instalado con sus seis contenedores en estado *healthy*, dominio del
+  panel configurado, y **el primer usuario registrado automáticamente** — que
+  era la parte más frágil de todo el conjunto.
+- `cloudflared` descargado para `linux/arm64`, túnel creado por API, reglas de
+  enrutado aplicadas (comodín a `localhost:80`, panel a `localhost:8000`,
+  `404` por defecto) y los dos CNAME creados.
+- El reintento se ejerció **en una avería real**, no simulada: un paso falló por
+  un fallo de red, y al relanzar el servicio saltó los diez pasos ya
+  completados y continuó justo donde se había quedado.
 - Todo esto salió de ahí, no de la teoría:
   - Con la partición CIDATA sola, el instalador **se para a preguntar**
     (`Continue with autoinstall?`). Por eso existe el reempaquetado de la ISO.
