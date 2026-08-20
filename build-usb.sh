@@ -24,6 +24,7 @@ PASSTHRU=''
 ISO_IN=''
 ISO_OUT=''
 SSH_KEY=''
+RESCUE_PW=''
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -57,6 +58,11 @@ OPCIONES
                       @/ruta/id_ed25519.pub. Se instala como fichero aparte,
                       no como argumento, porque las claves llevan espacios.
                       Si se indica, se desactiva el acceso por contrasena.
+  --rescue-password=V Contrasena para la cuenta 'installer'. Por defecto esa
+                      cuenta nace BLOQUEADA y nadie puede entrar: si el
+                      asistente fallara, la unica via seria el modo de
+                      recuperacion de GRUB. Con esto tienes una puerta de
+                      servicio. Acepta @/ruta/fichero o @-.
   --keyboard=XX       Teclado del instalador. Por defecto: es
   --out=DIR           Donde dejar user-data/meta-data. Por defecto: cloud-init/
   --                  Lo que venga despues se pasa tal cual a setup.sh:
@@ -78,6 +84,8 @@ while [ $# -gt 0 ]; do
         --iso)        shift; ISO_IN=$1 ;;
         --iso-out=*)  ISO_OUT=${1#*=} ;;
         --iso-out)    shift; ISO_OUT=$1 ;;
+        --rescue-password=*) RESCUE_PW=$(argval "${1#*=}") ;;
+        --rescue-password)   shift; RESCUE_PW=$(argval "$1") ;;
         --ssh-key=*)  SSH_KEY=$(argval "${1#*=}") ;;
         --ssh-key)    shift; SSH_KEY=$(argval "$1") ;;
         --keyboard=*) KEYBOARD=${1#*=} ;;
@@ -100,6 +108,65 @@ sh -n "$SETUP" || die "setup.sh no pasa la comprobacion de sintaxis; no se gener
 TMP=$(mktemp -d) || die "No se pudo crear un directorio temporal"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
+# Hash SHA-512 para /etc/shadow. Se prueban varias herramientas porque ninguna
+# esta garantizada: LibreSSL (macOS) no soporta 'passwd -6', y el modulo crypt
+# de Python desaparecio en 3.13. Ninguna recibe la contrasena por argv, que
+# seria visible en 'ps'.
+hash_password() {
+    if command -v mkpasswd >/dev/null 2>&1; then
+        printf '%s' "$1" | mkpasswd -m sha-512 --stdin
+    elif command -v openssl >/dev/null 2>&1 && printf x | openssl passwd -6 -stdin >/dev/null 2>&1; then
+        printf '%s' "$1" | openssl passwd -6 -stdin
+    elif command -v python3 >/dev/null 2>&1 && python3 -c 'import crypt' >/dev/null 2>&1; then
+        RESCUE_PW_ENV="$1" python3 -c 'import crypt,os; print(crypt.crypt(os.environ["RESCUE_PW_ENV"], crypt.mksalt(crypt.METHOD_SHA512)))'
+    else
+        die "No hay forma de generar el hash SHA-512.
+  Instala 'whois' (aporta mkpasswd) o usa un OpenSSL con 'passwd -6'."
+    fi
+}
+
+# Por defecto la cuenta de instalacion queda bloqueada: '!' no es un hash
+# valido, asi que no hay contrasena con la que entrar.
+INSTALLER_PW_HASH='!'
+if [ -n "$RESCUE_PW" ]; then
+    INSTALLER_PW_HASH=$(hash_password "$RESCUE_PW") \
+        || die "No se pudo generar el hash de la contrasena de rescate."
+    case "$INSTALLER_PW_HASH" in
+        \$6\$*) : ;;
+        *) die "El hash generado no parece SHA-512: ${INSTALLER_PW_HASH%%\$*}" ;;
+    esac
+fi
+
+# --- Bloque opcional con el token, como entrada extra de write_files --------
+if [ -n "$SSH_KEY" ]; then
+    case "$SSH_KEY" in
+        ssh-ed25519*|ssh-rsa*|ecdsa-sha2*) : ;;
+        *) die "Eso no parece una clave publica SSH: ${SSH_KEY%% *}" ;;
+    esac
+    PASSTHRU="$PASSTHRU --ssh-key=@/etc/coolify-setup.pub"
+fi
+
+if [ -n "$CF_TOKEN" ] || [ -n "$PASSTHRU" ]; then
+    {
+        printf '\n'
+        printf "      - path: /etc/coolify-setup.env\n"
+        printf "        owner: root:root\n"
+        printf "        permissions: '0600'\n"
+        printf "        content: |\n"
+        [ -n "$CF_TOKEN" ] && printf "          CF_API_TOKEN=%s\n" "$CF_TOKEN"
+        [ -n "$PASSTHRU" ] && printf "          SETUP_EXTRA_ARGS=%s\n" "$PASSTHRU"
+        if [ -n "$SSH_KEY" ]; then
+            printf '\n'
+            printf "      - path: /etc/coolify-setup.pub\n"
+            printf "        owner: root:root\n"
+            printf "        permissions: '0644'\n"
+            printf "        content: |\n"
+            printf "          %s\n" "$SSH_KEY"
+        fi
+    } > "$TMP/envblock"
+else
+    : > "$TMP/envblock"
+fi
 
 # --- Ensamblado --------------------------------------------------------------
 # El script se indenta 10 espacios para caber en el escalar literal de YAML.
@@ -107,14 +174,14 @@ sed 's/^/          /' "$SETUP" > "$TMP/setup.indented"
 sed 's/^/          /' "$UNIT"  > "$TMP/unit.indented"
 
 SETUP_FILE="$TMP/setup.indented" UNIT_FILE="$TMP/unit.indented" ENV_FILE="$TMP/envblock" \
-awk -v kbd="$KEYBOARD" '
+awk -v kbd="$KEYBOARD" -v pw="$INSTALLER_PW_HASH" '
     $0 == "__SETUP_SH__"  { while ((getline l < ENVIRON["SETUP_FILE"]) > 0) print l; next }
     $0 == "__UNIT_FILE__" { while ((getline l < ENVIRON["UNIT_FILE"])  > 0) print l; next }
     $0 == "__ENV_FILE__"  { while ((getline l < ENVIRON["ENV_FILE"])   > 0) print l; next }
-    { gsub(/__KEYBOARD__/, kbd); print }
+    { gsub(/__KEYBOARD__/, kbd); gsub(/__INSTALLER_PW_HASH__/, pw); print }
 ' "$TPL" > "$TMP/user-data"
 
-grep -q '__SETUP_SH__\|__UNIT_FILE__\|__ENV_FILE__\|__KEYBOARD__' \
+grep -q '__SETUP_SH__\|__UNIT_FILE__\|__ENV_FILE__\|__KEYBOARD__\|__INSTALLER_PW_HASH__' \
     "$TMP/user-data" && die "Quedaron marcadores sin sustituir en user-data"
 
 printf 'instance-id: coolify-minipc-%s\nlocal-hostname: ubuntu-tmp\n' \

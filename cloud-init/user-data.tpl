@@ -38,11 +38,12 @@ autoinstall:
   # Cuenta de servicio para completar la instalacion. Por defecto nace
   # bloqueada ('!' en el campo de contrasena de /etc/shadow) y nadie inicia
   # sesion con ella: setup.sh crea el usuario administrador real en el primer
-  # arranque. Asi no hay que generar ningun hash al construir el USB.
+  # arranque. Con build-usb.sh --rescue-password aqui va un hash real, para
+  # tener una via de entrada si el asistente fallara.
   identity:
     hostname: ubuntu-tmp
     username: installer
-    password: "!"
+    password: "__INSTALLER_PW_HASH__"
 
   ssh:
     install-server: true
