@@ -15,14 +15,14 @@ de Cloudflare**.
 |---|---|
 | Construir la ISO desatendida | Funciona. Verificado. |
 | Instalación de Ubuntu sin intervención | Funciona. Verificado en VM. |
-| Asistente de primer arranque (Docker, Coolify, túnel) | **No arranca.** En investigación. |
+| Arranque del asistente en el primer boot | Funciona. Verificado en VM. |
+| Hostname, zona horaria, usuario, SSH, Docker | Funciona. Verificado en VM. |
+| Coolify, túnel y DNS | Verificado contra una API de Cloudflare **simulada**, no contra la real. |
 
-El instalador deja Ubuntu Server puesto sin tocar nada, pero tras el reinicio el
-asistente no llega a ejecutarse, así que Docker, Coolify y el túnel **no se
-configuran todavía**. `setup.sh` sí funciona si lo lanzas a mano sobre un
-sistema ya arrancado (ver [Usarlo fuera del USB](#usarlo-fuera-del-usb)).
-
-Detalle y seguimiento en las incidencias del repositorio.
+Lo único que no se ha ejercitado contra servicios reales es la parte final:
+las llamadas a Cloudflare se probaron contra un simulador que imita sus
+respuestas, y el registro del primer usuario de Coolify depende del HTML de su
+formulario. Ver [Qué está verificado y qué no](#qué-está-verificado-y-qué-no).
 
 ## Qué se pregunta y qué no
 
@@ -59,6 +59,7 @@ usa el instalador nace bloqueada y el usuario real lo crea el propio script.
 |---|---|
 | `setup.sh` | Todo el trabajo. POSIX sh, autónomo, sirve también fuera del USB. |
 | `cloud-init/user-data.tpl` | Plantilla de autoinstall de Ubuntu. |
+| `cloud-init/coolify-setup.service` | Unidad systemd del asistente. Fuente única, usada por los dos caminos de instalación. |
 | `build-usb.sh` | Incrusta `setup.sh` en la plantilla y genera `cloud-init/user-data`. |
 | `cloud-init/user-data`, `meta-data` | Generados por `build-usb.sh`. No se versionan: pueden llevar el token dentro. |
 
@@ -148,11 +149,6 @@ tendrás que teclear `yes` una vez.
 1. **Instalación base**, sin una sola pregunta: particionado de todo el disco,
    red por DHCP, paquetes base. 5–15 minutos. Se reinicia solo.
 2. **Primer arranque**: el asistente toma la consola.
-
-   > **Hoy esto no ocurre**: el sistema arranca hasta el login y el asistente
-   > no se lanza. Lo de abajo describe el comportamiento previsto, todavía no
-   > alcanzado.
-
    - Con el token horneado y una sola zona: **no pregunta nada**.
    - Sin token horneado: pide el token (oculto) y, si hace falta, la zona.
    - Sin red: pide SSID y contraseña antes de nada.
@@ -181,6 +177,40 @@ curl -fsSL https://tu-servidor/setup.sh | sudo sh -s -- --cf-token=@/root/tok
 ```
 
 Opciones completas con `sh setup.sh --help`.
+
+## Cómo se instala el asistente (y por qué así)
+
+El asistente de primer arranque se instala con **`late-commands`**, que corren
+en el entorno del instalador con el sistema destino montado en `/target`. Ahí se
+copian el script y la unidad systemd, y se crea a mano el enlace en
+`multi-user.target.wants`.
+
+Lo natural habría sido usar `write_files` y `runcmd` bajo `autoinstall.user-data`,
+que es lo que la documentación de Ubuntu describe: esas directivas «afectan al
+sistema destino y se procesan en el primer arranque». En la práctica **no
+funcionó**: el servicio no se instalaba nunca y fallaba en silencio, sin un solo
+error. Es un modo de fallo bien documentado — `write_files` y `runcmd` son
+módulos *per-instance*, y cloud-init los omite si cree que ya vio esa instancia,
+cosa que puede pasar cuando el propio autoinstall se entrega por un seed NoCloud
+en el medio de instalación. Los detalles están en la incidencia
+[#1](https://github.com/fompi/culificador/issues/1).
+
+La diferencia de fondo no es qué mecanismo es más bonito, sino cuál es
+**observable cuando falla**. `late-commands` corre en un momento conocido y su
+salida sale por la consola del instalador; el otro camino depende del estado
+interno de cloud-init en el destino y, cuando no hace nada, no dice por qué.
+
+Dos precauciones que vienen de haber roto esto:
+
+- El bloque termina siempre en `true`. Un `late-commands` que devuelve error
+  **aborta la instalación entera** y deja el equipo sin instalar. Nos pasó.
+- No se usa `systemctl` dentro de `/target`: el enlace simbólico se crea a mano,
+  que es justo lo que hace `systemctl enable` y no necesita un systemd corriendo
+  allí.
+
+El bloque `user-data` se mantiene como camino redundante e idempotente: cubre el
+caso de arrancar desde una partición CIDATA suelta, donde no hay `/cdrom/cidata`
+del que copiar.
 
 ## Portabilidad y dependencias
 
@@ -218,10 +248,17 @@ Log completo con marcas de tiempo en `/var/log/coolify-setup.log`.
 Los argumentos de línea de comandos siempre pisan la configuración guardada de
 un intento anterior, así que puedes corregir un valor sin `--reset`.
 
-**Recuperar el acceso**: la cuenta `installer` nace bloqueada a propósito. Si el
-asistente fallara antes de crear tu usuario, entra por el modo de recuperación
-de GRUB (mantén <kbd>Shift</kbd> al arrancar → *Advanced options* → *recovery
-mode* → *root shell*).
+**Recuperar el acceso**: la cuenta `installer` nace bloqueada a propósito, así
+que no hace falta generar ningún hash al construir el USB. Si quieres una puerta
+de servicio por si el asistente fallara antes de crear tu usuario:
+
+```bash
+./build-usb.sh --iso=ubuntu.iso --rescue-password=@/ruta/a/una/contrasena
+```
+
+Sin ella, la única vía es el modo de recuperación de GRUB (mantén
+<kbd>Shift</kbd> al arrancar → *Advanced options* → *recovery mode* →
+*root shell*).
 
 ## Cosas que conviene saber
 
@@ -248,6 +285,16 @@ Probado ejecutándolo, no solo leyéndolo.
 
 - La ISO reempaquetada arranca e instala **sin ninguna intervención**:
   particionado LVM de todo el disco, red DHCP, reinicio.
+- Tras el reinicio, el asistente arranca solo y llega hasta el final:
+  `late-commands` deja los tres ficheros con los permisos correctos, el
+  servicio queda `enabled` y se ejecuta tomando la consola.
+- Comprobado dentro del sistema instalado: hostname derivado a `fompi`,
+  zona horaria `Europe/Madrid` aplicada (se ve en el propio log, cuyas marcas
+  de tiempo saltan dos horas justo en ese paso), usuario `ferran` creado en los
+  grupos `sudo` y `docker`, acceso por SSH con la clave horneada, y Docker
+  29.7.2 instalado y respondiendo.
+- Las llamadas a Cloudflare salen del sistema instalado y llegan al simulador:
+  verificación del token, resolución de la zona y consulta de la cuenta.
 - Todo esto salió de ahí, no de la teoría:
   - Con la partición CIDATA sola, el instalador **se para a preguntar**
     (`Continue with autoinstall?`). Por eso existe el reempaquetado de la ISO.
@@ -281,14 +328,6 @@ Probado ejecutándolo, no solo leyéndolo.
 - `build-usb.sh`: YAML válido, `setup.sh` incrustado idéntico byte a byte,
   parámetros de arranque y `/cidata` presentes en la ISO, sobrescritura al
   reejecutar, y guarda que impide destruir la ISO de origen.
-
-**Verificado que NO funciona:**
-
-- El asistente de primer arranque no se ejecuta tras el reinicio. Esperando
-  seis minutos con la consola serie enganchada: el sistema llega al login,
-  el hostname sigue sin cambiar y no hay ni una sola llamada a la API.
-  `subiquity/Userdata/apply_autoinstall_config` sí terminó sin avisos durante
-  la instalación, así que subiquity leyó y aplicó el bloque `user-data`.
 
 **No verificado:**
 
