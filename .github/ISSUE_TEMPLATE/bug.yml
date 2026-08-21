@@ -1,0 +1,49 @@
+name: Fallo
+description: Algo no funciona como dice la documentación
+labels: ["tipo:fallo"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Si es un problema de seguridad **no lo pongas aquí**: usa un aviso
+        privado (ver `SECURITY.md`).
+  - type: textarea
+    id: que-pasa
+    attributes:
+      label: Qué pasa
+      description: Y qué esperabas que pasara.
+    validations: {required: true}
+  - type: dropdown
+    id: fase
+    attributes:
+      label: En qué fase
+      options:
+        - Construir la ISO (build-usb.sh)
+        - Instalación de Ubuntu
+        - Primer arranque / asistente
+        - Docker
+        - Coolify
+        - Túnel de Cloudflare o DNS
+        - Otra
+    validations: {required: true}
+  - type: textarea
+    id: reproducir
+    attributes:
+      label: Cómo reproducirlo
+      description: El comando exacto, con los secretos tachados.
+      render: shell
+    validations: {required: true}
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        `/var/log/coolify-setup.log`. **Revísalo antes de pegarlo**: lleva
+        nombres de dominio y puede llevar credenciales generadas.
+      render: text
+  - type: input
+    id: entorno
+    attributes:
+      label: Entorno
+      placeholder: "Ubuntu 24.04.4, x86_64, hardware / VM, versión de setup.sh"
+    validations: {required: true}

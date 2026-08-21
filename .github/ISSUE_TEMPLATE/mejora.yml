@@ -1,0 +1,27 @@
+name: Mejora
+description: Propuesta de cambio o funcionalidad
+labels: ["tipo:mejora"]
+body:
+  - type: textarea
+    id: problema
+    attributes:
+      label: Qué problema resuelve
+      description: El problema, no la solución. Si no hay problema, no hay cambio.
+    validations: {required: true}
+  - type: textarea
+    id: propuesta
+    attributes:
+      label: Propuesta
+    validations: {required: true}
+  - type: textarea
+    id: alternativas
+    attributes:
+      label: Alternativas descartadas y por qué
+  - type: checkboxes
+    id: principios
+    attributes:
+      label: Encaje con los principios del proyecto
+      options:
+        - label: "No añade preguntas que se puedan derivar, obtener por API o generar"
+        - label: "Sigue siendo POSIX sh, sin bashismos"
+        - label: "El paso nuevo es idempotente y reintentable"

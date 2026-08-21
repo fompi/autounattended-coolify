@@ -1,5 +1,10 @@
 # USB de instalación desatendida — Ubuntu Server + Docker + Coolify + Cloudflare Tunnel
 
+[![CI](https://github.com/fompi/culificador/actions/workflows/ci.yml/badge.svg)](https://github.com/fompi/culificador/actions/workflows/ci.yml)
+[![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
+[![POSIX sh](https://img.shields.io/badge/shell-POSIX%20sh-89e051.svg)](CONTRIBUTING.md)
+[![Ubuntu 24.04 LTS](https://img.shields.io/badge/Ubuntu-24.04%20LTS-E95420.svg?logo=ubuntu&logoColor=white)](https://ubuntu.com/download/server)
+
 Arrancas el mini PC desde el USB y, sin tocar nada, acabas con Ubuntu Server
 instalado, Docker y Coolify corriendo, y un túnel de Cloudflare enrutando
 `*.app.tudominio.tld` y `coolify.tudominio.tld` hacia el equipo.
@@ -64,6 +69,9 @@ usa el instalador nace bloqueada y el usuario real lo crea el propio script.
 | `cloud-init/coolify-setup.service` | Unidad systemd del asistente. Fuente única, usada por los dos caminos de instalación. |
 | `build-usb.sh` | Incrusta `setup.sh` en la plantilla y genera `cloud-init/user-data`. |
 | `cloud-init/user-data`, `meta-data` | Generados por `build-usb.sh`. No se versionan: pueden llevar el token dentro. |
+| `tests/run.sh` | Suite de pruebas. `make test`. |
+| `tests/cf-mock.py` | Simulador de la API de Cloudflare que usan las pruebas. |
+| `Makefile` | Atajos: `make test`, `make lint`, `make iso ISO=...`. |
 
 ## Uso
 
@@ -232,6 +240,35 @@ rompería al reiniciar.
 
 Docker y Coolify solo se instalan en Linux. En macOS o BSD el script avisa y hay
 que usar `--skip-docker` / `--skip-coolify`.
+
+## Desarrollo
+
+```bash
+make test    # 81 comprobaciones, sin dependencias obligatorias
+make lint    # shellcheck en dialecto sh + sintaxis en varios shells
+make build   # genera cloud-init/user-data
+make iso ISO=ubuntu-24.04.4-live-server-amd64.iso
+```
+
+La suite se salta los grupos para los que le falte una herramienta y lo dice.
+En CI se exige que **no se omita ninguno**: si falta una dependencia en el
+runner, el build falla en vez de dar verde sin haber probado.
+
+Grupos: `syntax`, `json`, `validators`, `resolution`, `build`, `latecommands`.
+Se pueden pedir sueltos: `sh tests/run.sh json build`.
+
+**Lo que la suite no puede cubrir**, y hay que probar a mano en una VM:
+
+- El arranque real desde la ISO y el primer boot.
+- El paso `tunnel_service`, que habla con el edge real de Cloudflare.
+
+Si tocas `cloud-init/user-data.tpl`, la unidad systemd o el bloque
+`late-commands`, prueba en una VM. Ese camino ya se rompió una vez **en
+silencio**, y las pruebas automáticas solo comprueban la forma del artefacto,
+no que arranque.
+
+Detalles en [CONTRIBUTING.md](CONTRIBUTING.md). Modelo de amenaza y manejo de
+secretos en [SECURITY.md](SECURITY.md).
 
 ## Si algo falla
 

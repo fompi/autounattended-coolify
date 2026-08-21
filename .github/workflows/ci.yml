@@ -1,0 +1,112 @@
+name: CI
+
+# Seguridad: en este fichero no se interpola NINGUN dato de evento
+# (titulos, cuerpos, ramas de PR...) dentro de un bloque `run:`. Las unicas
+# expresiones son github.ref y github.sha, que no son controlables por quien
+# abre un PR. Si algun dia hace falta usar datos de evento, van por `env:` y
+# se citan como "$VAR", nunca inline.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint y estilo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar herramientas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck dash ksh zsh
+
+      # El proyecto es POSIX sh a proposito: se analiza como sh, no como bash,
+      # para que shellcheck marque los bashismos en vez de aceptarlos.
+      - name: shellcheck (dialecto sh)
+        run: shellcheck -s sh -S warning setup.sh build-usb.sh tests/run.sh
+
+      - name: Comprobacion de sintaxis en varios shells
+        run: |
+          for f in setup.sh build-usb.sh tests/run.sh; do
+            for s in sh dash bash ksh zsh; do
+              command -v "$s" >/dev/null || continue
+              "$s" -n "$f" || { echo "::error file=$f::$s -n falla"; exit 1; }
+            done
+          done
+
+      - name: Fin de linea y permisos
+        run: |
+          if grep -rlIU "$(printf '\r')" --exclude-dir=.git . ; then
+            echo "::error::hay ficheros con CRLF"; exit 1
+          fi
+          for f in setup.sh build-usb.sh tests/run.sh; do
+            [ -x "$f" ] || { echo "::error file=$f::deberia ser ejecutable"; exit 1; }
+          done
+
+  test:
+    name: Suite de pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq dash python3-yaml whois
+
+      # La suite se salta grupos si le falta una herramienta. En CI no debe
+      # saltarse ninguno: si algo se omite aqui es que falta una dependencia en
+      # el runner, y estariamos publicando verde sin haber probado esa parte.
+      - name: Ejecutar la suite (y exigir que no omita nada)
+        run: |
+          NO_COLOR=1 sh tests/run.sh | tee /tmp/out.txt
+          if grep -q ' skip ' /tmp/out.txt; then
+            echo "::error::algun grupo se omitio en CI"
+            grep ' skip ' /tmp/out.txt
+            exit 1
+          fi
+
+  build:
+    name: Construir el user-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xorriso python3-yaml whois
+
+      - name: Generar y validar
+        run: |
+          ./build-usb.sh --out=/tmp/cidata
+          test -s /tmp/cidata/user-data
+          python3 -c "import yaml; yaml.safe_load(open('/tmp/cidata/user-data'))"
+
+      - name: Comprobar que no se filtran secretos
+        run: |
+          ./build-usb.sh --out=/tmp/secret --cf-token=TOKEN-DE-PRUEBA >/dev/null
+          grep -q 'TOKEN-DE-PRUEBA' /tmp/secret/user-data
+          # El artefacto que lleva el token no puede estar versionado.
+          git check-ignore -q cloud-init/user-data
+          # Y no debe haber ningun token real en el arbol.
+          if git grep -nE 'CF_API_TOKEN=[A-Za-z0-9_-]{12,}' -- . ; then
+            echo "::error::posible token en el repositorio"; exit 1
+          fi
+
+      - name: Subir el user-data generado
+        uses: actions/upload-artifact@v4
+        with:
+          name: user-data-${{ github.sha }}
+          path: /tmp/cidata/
+          retention-days: 7
