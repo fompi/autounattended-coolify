@@ -99,8 +99,10 @@ jobs:
           grep -q 'TOKEN-DE-PRUEBA' /tmp/secret/user-data
           # El artefacto que lleva el token no puede estar versionado.
           git check-ignore -q cloud-init/user-data
-          # Y no debe haber ningun token real en el arbol.
-          if git grep -nE 'CF_API_TOKEN=[A-Za-z0-9_-]{12,}' -- . ; then
+          # Y no debe haber ningun token real en el arbol. Se excluye tests/,
+          # donde hay cadenas de prueba deliberadas (GOODTOKEN y similares):
+          # sin excluirlo, este guardian falla contra su propio fixture.
+          if git grep -nE 'CF_API_TOKEN=[A-Za-z0-9_-]{12,}' -- . ':!tests/' ; then
             echo "::error::posible token en el repositorio"; exit 1
           fi
 

@@ -11,3 +11,7 @@
 *.pub
 *token*
 !**/*.md
+
+# Basura del sistema operativo.
+.DS_Store
+Thumbs.db
