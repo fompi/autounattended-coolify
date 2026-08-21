@@ -1087,6 +1087,7 @@ run_step cloudflared_bin "Binario de cloudflared" do_cloudflared_bin
 
 # --- Túnel ----------------------------------------------------------------
 TUNNEL_FILE="$STATE_DIR/tunnel.env"
+# shellcheck source=/dev/null
 [ -f "$TUNNEL_FILE" ] && . "$TUNNEL_FILE"
 
 do_tunnel_create() {
@@ -1114,6 +1115,7 @@ do_tunnel_create() {
     chmod 600 "$TUNNEL_FILE"
 }
 run_step tunnel_create "Túnel de Cloudflare" do_tunnel_create
+# shellcheck source=/dev/null
 [ -f "$TUNNEL_FILE" ] && . "$TUNNEL_FILE"
 
 do_tunnel_ingress() {

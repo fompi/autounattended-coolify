@@ -75,8 +75,10 @@ if have shellcheck; then
 else
     skip "shellcheck" "no instalado"
 fi
-# Bashismos que romperian en dash/ash: se buscan explicitamente porque
-# shellcheck no siempre esta disponible.
+# Bashismos que romperian en dash/ash. Se buscan explicitamente porque la
+# herramienta shellcheck no siempre esta instalada.
+# (Ojo: un comentario que empiece por "# shellcheck " se interpreta como
+#  directiva y rompe el analisis. De ahi la redaccion.)
 for pat in '\[\[[[:space:]]' 'printf -v' '\bdeclare\b' '\blocal -' '\$\{[A-Za-z_]*\^\^\}' '\$\{[A-Za-z_]*,,\}'; do
     if grep -nE "$pat" "$ROOT/setup.sh" "$ROOT/build-usb.sh" > "$TMP/hit" 2>/dev/null; then
         bad "sin bashismos ($pat)" "$(head -2 "$TMP/hit")"
@@ -97,6 +99,9 @@ extract_fns() {
     setup_json() { :; }
 }
 extract_fns
+# Estas variables las consumen las funciones cargadas con eval mas arriba,
+# cosa que el analizador no puede ver.
+# shellcheck disable=SC2034
 WORK_DIR="$TMP"
 
 J='{"success":true,"result":[{"id":"abc","name":"fompi.net"}],"result_info":{"count":3}}'
@@ -118,12 +123,20 @@ run_json_cases() {
     is "[$eng] mensaje de error"    "Invalid API Token" "$(printf '%s' "$E" | json_get '.errors[0].message')"
 }
 if have python3; then
-    PY=python3; JSON_MODE=py; run_json_cases py
+    # shellcheck disable=SC2034
+    PY=python3
+    # shellcheck disable=SC2034
+    JSON_MODE=py
+    run_json_cases py
 else
     skip "motor python3" "no instalado"
 fi
 if have jq; then
-    JQ=$(command -v jq); JSON_MODE=jq; run_json_cases jq
+    # shellcheck disable=SC2034
+    JQ=$(command -v jq)
+    # shellcheck disable=SC2034
+    JSON_MODE=jq
+    run_json_cases jq
 else
     skip "motor jq" "no instalado"
 fi
@@ -175,16 +188,25 @@ else
     python3 "$HERE/cf-mock.py" "$PORT" >"$TMP/mock.log" 2>&1 &
     MOCK_PID=$!
     # Esperar a que escuche en vez de dormir a ciegas.
+    # Esperar a que el simulador escuche. Nada de /dev/tcp: es de bash y este
+    # script tambien tiene que correr en dash.
     i=0
-    while [ $i -lt 50 ]; do
-        if (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then break; fi
+    while [ $i -lt 100 ]; do
+        if python3 -c "import socket,sys
+s = socket.socket(); s.settimeout(0.2)
+sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
+            break
+        fi
         i=$((i+1)); sleep 0.1
-    done 2>/dev/null || true
-    sleep 0.5
+    done
 
+    # Estado limpio en cada llamada. Con un contador no valdria: setup() se
+    # invoca dentro de $(...), o sea en un subshell, y el incremento no vuelve
+    # al padre; todas las llamadas compartirian directorio y reutilizarian la
+    # configuracion guardada de la anterior.
     setup() { # setup ARGS... -> salida combinada
         env CF_API_BASE="http://127.0.0.1:$PORT" \
-            XDG_STATE_HOME="$TMP/state$RANDOM$$" \
+            XDG_STATE_HOME="$(mktemp -d "$TMP/state.XXXXXX")" \
             HOME="$TMP" NO_COLOR=1 \
             sh "$ROOT/setup.sh" "$@" 2>&1 || true
     }
