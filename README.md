@@ -316,6 +316,46 @@ Sin ella, la única vía es el modo de recuperación de GRUB (mantén
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
   una app en Coolify le pones un dominio con ese patrón y funciona sin tocar DNS.
 
+## Limitaciones conocidas
+
+Análisis del proyecto a fecha de hoy. Cada punto tiene su incidencia con el
+detalle, las implicaciones y un esbozo de solución.
+
+### Seguridad
+
+| | Qué pasa |
+|---|---|
+| [#2](https://github.com/fompi/culificador/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
+| [#3](https://github.com/fompi/culificador/issues/3) | **Secretos que sobreviven.** El token de Cloudflare queda en `/etc/coolify-setup.env`, el del túnel en `tunnel.env`, y las contraseñas en el resumen. Nada se borra. |
+| [#4](https://github.com/fompi/culificador/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
+| [#8](https://github.com/fompi/culificador/issues/8) | `build-usb.sh` no verifica la ISO de entrada. |
+| [#9](https://github.com/fompi/culificador/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
+| [#12](https://github.com/fompi/culificador/issues/12) | La geolocalización de la IP se hace por defecto y sin avisar. |
+
+### Sin verificar
+
+| | Qué pasa |
+|---|---|
+| [#6](https://github.com/fompi/culificador/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. |
+| [#10](https://github.com/fompi/culificador/issues/10) | **x86_64 y arranque BIOS sin verificar**, siendo el destino declarado del proyecto. Todo se ha probado en arm64 con UEFI. |
+
+### Deuda y operación
+
+| | Qué pasa |
+|---|---|
+| [#5](https://github.com/fompi/culificador/issues/5) | `cloudflared` se instala desde `latest`: dos equipos con la misma ISO acaban distintos. |
+| [#7](https://github.com/fompi/culificador/issues/7) | El registro del primer usuario de Coolify raspa su HTML. Se romperá en alguna actualización. |
+| [#11](https://github.com/fompi/culificador/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
+| [#13](https://github.com/fompi/culificador/issues/13) | Sin versionado real: no se puede saber qué versión instaló un equipo. |
+| [#14](https://github.com/fompi/culificador/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
+| [#15](https://github.com/fompi/culificador/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
+
+**Si vas a usarlo en serio**, lo mínimo antes es [#2](https://github.com/fompi/culificador/issues/2),
+[#4](https://github.com/fompi/culificador/issues/4) y
+[#6](https://github.com/fompi/culificador/issues/6): integridad de lo que se
+instala, no quedar expuesto en la LAN, y comprobar que el túnel levanta de
+verdad.
+
 ## Qué está verificado y qué no
 
 Probado ejecutándolo, no solo leyéndolo.
