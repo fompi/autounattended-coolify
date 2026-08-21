@@ -72,19 +72,27 @@ autoinstall:
   #   - No se usa 'systemctl' dentro de /target: el enlace en
   #     multi-user.target.wants se crea a mano, que es exactamente lo que hace
   #     'systemctl enable' y no necesita un systemd corriendo alli.
+  #   - mkdir+cp+chmod en vez de 'install -D': el -D que crea los directorios
+  #     intermedios es una extension de GNU coreutils. Aqui siempre hay GNU
+  #     (el instalador es Ubuntu), pero asi el bloque se puede ejecutar y
+  #     comprobar en cualquier POSIX, que es lo que hace tests/run.sh.
   late-commands:
     - |
       for d in /cdrom/cidata /media/cdrom/cidata /run/media/cdrom/cidata; do
         if [ -f "$d/coolify-setup.sh" ]; then
-          install -D -m 0755 "$d/coolify-setup.sh" /target/usr/local/sbin/coolify-setup.sh
-          install -D -m 0644 "$d/coolify-setup.service" /target/etc/systemd/system/coolify-setup.service
+          mkdir -p /target/usr/local/sbin /target/etc/systemd/system/multi-user.target.wants
+          cp "$d/coolify-setup.sh" /target/usr/local/sbin/coolify-setup.sh
+          chmod 0755 /target/usr/local/sbin/coolify-setup.sh
+          cp "$d/coolify-setup.service" /target/etc/systemd/system/coolify-setup.service
+          chmod 0644 /target/etc/systemd/system/coolify-setup.service
           if [ -f "$d/coolify-setup.env" ]; then
-            install -D -m 0600 "$d/coolify-setup.env" /target/etc/coolify-setup.env
+            cp "$d/coolify-setup.env" /target/etc/coolify-setup.env
+            chmod 0600 /target/etc/coolify-setup.env
           fi
           if [ -f "$d/coolify-setup.pub" ]; then
-            install -D -m 0644 "$d/coolify-setup.pub" /target/etc/coolify-setup.pub
+            cp "$d/coolify-setup.pub" /target/etc/coolify-setup.pub
+            chmod 0644 /target/etc/coolify-setup.pub
           fi
-          mkdir -p /target/etc/systemd/system/multi-user.target.wants
           ln -sf ../coolify-setup.service \
             /target/etc/systemd/system/multi-user.target.wants/coolify-setup.service
           echo "coolify-setup: instalado desde $d"
