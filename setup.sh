@@ -604,7 +604,11 @@ valid_email() {
 
 # Zona horaria que ya tiene el sistema, por stdout; cadena vacía si no hay.
 # El parámetro RAIZ solo existe para poder probar la función contra un /etc
-# simulado: en producción se llama sin argumentos.
+# simulado: en producción se llama sin argumentos. Eso es justo lo que detecta
+# SC2120, así que se silencia aquí: shellcheck 0.9 (el de Ubuntu, y por tanto
+# el de CI) lo marca y 0.11 ya no, de modo que sin esto el lint depende de qué
+# versión tenga instalada quien lo ejecute.
+# shellcheck disable=SC2120
 system_timezone() {
     _tzroot=${1:-}
     _tz=''
