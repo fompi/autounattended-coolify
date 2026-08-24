@@ -44,6 +44,18 @@ jobs:
             done
           done
 
+      # El repositorio se llamo 'culificador' y los enlaces de la
+      # documentacion se quedaron apuntando ahi: 21 enlaces rotos, badge de CI
+      # incluido. Reaparecio cuatro veces al rebasar ramas escritas antes de la
+      # correccion, asi que deja de ser un despiste y pasa a ser un guardian.
+      # Se busca la URL, no el nombre suelto: el README lo menciona a proposito
+      # al explicar el arreglo.
+      - name: Enlaces al nombre viejo del repositorio
+        run: |
+          if grep -rn 'github\.com/fompi/culificador' --exclude-dir=.git . ; then
+            echo "::error::hay enlaces al repositorio viejo (fompi/culificador)"; exit 1
+          fi
+
       - name: Fin de linea y permisos
         run: |
           if grep -rlIU "$(printf '\r')" --exclude-dir=.git . ; then
