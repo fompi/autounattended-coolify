@@ -20,6 +20,13 @@ set -eu
 VERSION="2.0"
 UA="coolify-setup/$VERSION"
 
+# Versiones fijadas de lo que se descarga. Antes cloudflared venia de
+# 'releases/latest': dos equipos instalados con la MISMA ISO acababan con
+# binarios distintos segun el dia, y no habia forma de reproducir una
+# instalacion de hace un mes (#5).
+CLOUDFLARED_VERSION_DEFAULT=2026.8.2
+JQ_VERSION=1.7.1
+
 # ============================================================================
 # Rutas de estado y trabajo
 # ============================================================================
@@ -115,6 +122,9 @@ CLOUDFLARE
                          token cubre una sola zona se usa esa sin preguntar.
   --app-subdomain=SUB    Subdominio comodín para las apps. Por defecto: app
   --coolify-subdomain=S  Subdominio del panel de Coolify. Por defecto: coolify
+  --cloudflared-version=X  Version de cloudflared a instalar. Por defecto:
+                         $CLOUDFLARED_VERSION_DEFAULT. No se usa 'latest' a proposito: la
+                         instalacion tiene que ser reproducible.
 
 SISTEMA (todo opcional, todo derivado o generado si se omite)
   --hostname=NOMBRE      Por defecto: primera etiqueta del dominio.
@@ -189,6 +199,7 @@ NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
+CLOUDFLARED_VERSION=''
 
 # Argumentos horneados en el USB al construirlo (via EnvironmentFile del
 # servicio systemd). Van delante para que lo que se pase a mano los pueda pisar.
@@ -208,6 +219,8 @@ while [ $# -gt 0 ]; do
         --app-subdomain)        shift; APP_SUBDOMAIN=$1 ;;
         --coolify-subdomain=*)  COOLIFY_SUBDOMAIN=${1#*=} ;;
         --coolify-subdomain)    shift; COOLIFY_SUBDOMAIN=$1 ;;
+        --cloudflared-version=*) CLOUDFLARED_VERSION=${1#*=} ;;
+        --cloudflared-version)  shift; CLOUDFLARED_VERSION=$1 ;;
         --hostname=*)           NEW_HOSTNAME=${1#*=} ;;
         --hostname)             shift; NEW_HOSTNAME=$1 ;;
         --admin-user=*)         ADMIN_USER=${1#*=} ;;
@@ -358,8 +371,8 @@ setup_json() {
         esac
         [ -n "$jq_plat" ] || die "Sin jq ni python disponibles y no hay binario de jq para $OS_N/$ARCH_N."
         info "Descargando jq a $WORK_DIR (uso temporal, no se instala)"
-        fetch_file "https://github.com/jqlang/jq/releases/download/jq-1.7.1/$jq_plat" "$WORK_DIR/jq" \
-            || die "No se pudo descargar jq."
+        fetch_file "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/$jq_plat" "$WORK_DIR/jq" \
+            || die "No se pudo descargar jq $JQ_VERSION."
         chmod +x "$WORK_DIR/jq"
         JQ="$WORK_DIR/jq"; JSON_MODE=jq
     fi
@@ -734,7 +747,7 @@ if [ -f "$CONFIG_FILE" ]; then
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
               NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
               WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD \
-              INSTALLER_USER; do
+              INSTALLER_USER CLOUDFLARED_VERSION; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
     done
@@ -743,6 +756,7 @@ fi
 
 : "${APP_SUBDOMAIN:=app}"
 : "${INSTALLER_USER:=installer}"
+: "${CLOUDFLARED_VERSION:=$CLOUDFLARED_VERSION_DEFAULT}"
 : "${COOLIFY_SUBDOMAIN:=coolify}"
 
 info "Resolviendo configuración"
@@ -986,6 +1000,7 @@ WIFI_PASSWORD='$(printf '%s' "$WIFI_PASSWORD" | sed "s/'/'\\\\''/g")'
 COOLIFY_EMAIL='$COOLIFY_EMAIL'
 COOLIFY_PASSWORD='$(printf '%s' "$COOLIFY_PASSWORD" | sed "s/'/'\\\\''/g")'
 INSTALLER_USER='$INSTALLER_USER'
+CLOUDFLARED_VERSION='$CLOUDFLARED_VERSION'
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -1231,13 +1246,28 @@ do_cloudflared_bin() {
         CLOUDFLARED_BIN=$(command -v cloudflared)
         return 0
     fi
+    # Guarda de sistema operativo, como en do_docker y do_coolify. Cloudflare
+    # solo publica binarios sueltos para Linux: en macOS este mismo codigo
+    # componia 'cloudflared-darwin-amd64', que NO existe como asset (para
+    # darwin solo hay .tgz), y moria con un 404 opaco.
+    if [ "$OS_N" != linux ]; then
+        err "La descarga automática de cloudflared solo está soportada en Linux."
+        err "En macOS instálalo con 'brew install cloudflared' y reejecuta, o usa --skip-tunnel."
+        return 1
+    fi
     # cloudflared es un servicio permanente, no andamiaje: va a /usr/local/bin
     # para que la unidad de systemd siga siendo válida tras reiniciar.
     dest=/usr/local/bin/cloudflared
     [ -n "$IS_ROOT" ] || dest="$WORK_DIR/cloudflared"
-    url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-$OS_N-$ARCH_N"
-    info "Descargando cloudflared ($OS_N/$ARCH_N)"
-    fetch_file "$url" "$dest.tmp" || { err "No se pudo descargar cloudflared desde $url"; return 1; }
+    asset="cloudflared-$OS_N-$ARCH_N"
+    url="https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/$asset"
+    info "Descargando cloudflared $CLOUDFLARED_VERSION ($OS_N/$ARCH_N)"
+    fetch_file "$url" "$dest.tmp" || {
+        err "No se pudo descargar cloudflared desde $url"
+        err "Comprueba que la versión '$CLOUDFLARED_VERSION' existe en las releases"
+        err "de cloudflare/cloudflared, o indica otra con --cloudflared-version=X."
+        return 1
+    }
     chmod +x "$dest.tmp" && mv "$dest.tmp" "$dest" || return 1
     "$dest" --version >/dev/null 2>&1 || { err "El binario descargado de cloudflared no funciona."; return 1; }
     CLOUDFLARED_BIN=$dest

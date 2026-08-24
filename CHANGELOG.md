@@ -29,6 +29,12 @@ Versionado [semántico](https://semver.org/lang/es/).
   `--keep-rescue`, `--purge-installer` e `--installer-user`. El paso nunca
   aborta la instalación y el resumen dice siempre cómo quedó la cuenta.
 
+### Cambiado
+- **`cloudflared` se instala en una versión fija** ([#5]), no desde
+  `releases/latest`: la misma ISO tiene que dar el mismo sistema. Nueva
+  `--cloudflared-version=X`, que sobrevive al reintento. La URL de `jq` pasa a
+  componerse con la misma constante de versión.
+
 ### Corregido
 - **Reejecutar dejaba túneles huérfanos en Cloudflare** ([#15]). El nombre del
   túnel era `coolify-$HOSTNAME`, así que reinstalar el equipo con otro hostname
@@ -48,6 +54,9 @@ Versionado [semántico](https://semver.org/lang/es/).
   —sin salida a internet, puerto 7844 bloqueado, token del túnel inválido—, que
   tienen tres soluciones distintas. Y un `cloudflared` ya activo solo se da por
   bueno si lleva el token de *este* túnel, no el de un intento anterior.
+- `do_cloudflared_bin` no tenía guarda de sistema operativo: en macOS componía
+  `cloudflared-darwin-amd64`, que no existe como asset, y moría con un 404
+  opaco. Ahora lo dice y apunta a `brew install cloudflared`.
 - El bloque `late-commands` usaba `install -D`, que es una extensión de GNU.
   Ahora `mkdir -p` + `cp` + `chmod`, para poder ejecutarlo y comprobarlo en
   cualquier POSIX.
@@ -75,6 +84,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#1]: https://github.com/fompi/autounattended-coolify/issues/1
 [#3]: https://github.com/fompi/autounattended-coolify/issues/3
 [#6]: https://github.com/fompi/autounattended-coolify/issues/6
+[#5]: https://github.com/fompi/autounattended-coolify/issues/5
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15

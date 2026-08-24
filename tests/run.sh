@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer resolution tunnel
+# Grupos: syntax json validators timezone secrets installer descargas resolution tunnel build latecommands
 #         build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
@@ -49,7 +49,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer resolution tunnel build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer descargas resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -456,6 +456,38 @@ for f in --keep-rescue --purge-installer --installer-user; do
 done
 fi
 
+# --------------------------------------------------------------- descargas
+if want descargas; then
+group "Descargas fijadas y verificadas (#5, #2)"
+
+# Guardian de regresion de #5: 'latest' no puede volver. Con 'latest' dos
+# equipos hechos con la misma ISO acaban con binarios distintos, y ademas no
+# hay hash posible que comprobar.
+if grep -q 'releases/latest/download' "$ROOT/setup.sh"; then
+    bad "setup.sh no descarga de 'releases/latest'" \
+        "$(grep -n 'releases/latest/download' "$ROOT/setup.sh" | head -2)"
+else
+    ok "setup.sh no descarga de 'releases/latest'"
+fi
+if grep -q 'releases/download/\$CLOUDFLARED_VERSION/' "$ROOT/setup.sh"; then
+    ok "cloudflared se descarga de una version concreta"
+else
+    bad "cloudflared se descarga de una version concreta"
+fi
+case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+    *--cloudflared-version*) ok "--cloudflared-version aparece en la ayuda" ;;
+    *) bad "--cloudflared-version aparece en la ayuda" ;;
+esac
+# Sin guarda de sistema operativo, en macOS se componia
+# 'cloudflared-darwin-amd64', que no existe como asset, y moria con un 404.
+sed -n '/^do_cloudflared_bin() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/cfbin.sh"
+if grep -q 'OS_N" != linux' "$TMP/cfbin.sh"; then
+    ok "do_cloudflared_bin tiene guarda de sistema operativo"
+else
+    bad "do_cloudflared_bin tiene guarda de sistema operativo" "en macOS moriria con un 404"
+fi
+fi
+
 # --------------------------------------------------------------- resolucion
 if want resolution; then
 group "Resolucion de configuracion (contra la API simulada)"
@@ -553,6 +585,19 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
         *"*.nuevo.fompi.net"*) ok "los argumentos pisan lo guardado" ;;
         *) bad "los argumentos pisan lo guardado" "$(printf '%s' "$out" | grep Apps || true)" ;;
     esac
+
+    # #5: el pin de cloudflared tiene que sobrevivir al reintento; si no, un
+    # segundo intento instalaria otra version y adios reproducibilidad.
+    V="$TMP/cfver"
+    env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$V" HOME="$TMP" NO_COLOR=1 \
+        sh "$ROOT/setup.sh" --cf-token=GOODTOKEN --domain=fompi.net \
+        --cloudflared-version=2020.1.1 --dry-run --non-interactive >/dev/null 2>&1 || true
+    if grep -q "CLOUDFLARED_VERSION='2020.1.1'" "$V/coolify-setup/config.env" 2>/dev/null; then
+        ok "--cloudflared-version se guarda para el reintento"
+    else
+        bad "--cloudflared-version se guarda para el reintento" \
+            "$(grep -c . "$V/coolify-setup/config.env" 2>/dev/null || echo 'sin config.env')"
+    fi
 
     # #3: si el asistente falla a mitad, los secretos TIENEN que seguir ahi
     # para que el reintento no vuelva a pedir el token. Sin --dry-run y sin

@@ -418,6 +418,12 @@ conserva tal cual, y `--installer-user=NOMBRE` sirve si le pusiste otro nombre.
   inventarse un modo de fallo tardío por no haber podido comprobar nada.
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
   una app en Coolify le pones un dominio con ese patrón y funciona sin tocar DNS.
+- **Versiones fijadas.** `cloudflared` y `jq` se instalan en una versión concreta
+  escrita en `setup.sh`, no en `latest`: la misma ISO tiene que dar el mismo
+  sistema hoy y dentro de seis meses. El contrapeso es que **un pin envejece**:
+  si nadie lo sube, acaba instalando una versión con vulnerabilidades conocidas,
+  que es peor que `latest`. Mientras no haya un proceso que lo actualice, revisa
+  el pin de vez en cuando y usa `--cloudflared-version=X` para saltártelo.
 
 ## Limitaciones conocidas
 
@@ -443,7 +449,6 @@ detalle, las implicaciones y un esbozo de solución.
 
 | | Qué pasa |
 |---|---|
-| [#5](https://github.com/fompi/autounattended-coolify/issues/5) | `cloudflared` se instala desde `latest`: dos equipos con la misma ISO acaban distintos. |
 | [#7](https://github.com/fompi/autounattended-coolify/issues/7) | El registro del primer usuario de Coolify raspa su HTML. Se romperá en alguna actualización. |
 | [#11](https://github.com/fompi/autounattended-coolify/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
 | [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Sin versionado real: no se puede saber qué versión instaló un equipo. |
