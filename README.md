@@ -308,7 +308,7 @@ que usar `--skip-docker` / `--skip-coolify`.
 ## Desarrollo
 
 ```bash
-make test    # 257 comprobaciones, sin dependencias obligatorias
+make test    # 356 comprobaciones, sin dependencias obligatorias
 make lint    # shellcheck en dialecto sh + sintaxis en varios shells
 make build   # genera cloud-init/user-data
 make iso ISO=ubuntu-24.04.4-live-server-amd64.iso
@@ -473,8 +473,8 @@ detalle, las implicaciones y un esbozo de solución.
 | [#7](https://github.com/fompi/autounattended-coolify/issues/7) | El registro del primer usuario de Coolify **raspa su HTML**: se romperá en alguna actualización de Coolify. Lo que ya no hace es mentir — el éxito se comprueba releyendo `/register`, no por el código HTTP— y el resumen distingue registrado, ya existía, pendiente y omitido (`--skip-coolify-register`). |
 | [#11](https://github.com/fompi/autounattended-coolify/issues/11) | **Sin copias y sin monitorización.** No hay copia de `/data/coolify` ni aviso si el túnel se cae. Lo que sí está resuelto es el fallo más probable —los logs de los contenedores llenando el disco, ahora limitados en `/etc/docker/daemon.json`— y los parches de seguridad automáticos (`--auto-reboot`, `--no-unattended-upgrades`). |
 | [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Quedan pendientes las etiquetas semánticas, el workflow de release y el aviso en CI cuando se toca el código sin tocar el `CHANGELOG.md`. La trazabilidad básica ya está: ver «Versiones» más abajo. |
-| [#14](https://github.com/fompi/autounattended-coolify/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
-| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
+| [#14](https://github.com/fompi/autounattended-coolify/issues/14) | *Resuelto.* El repositorio es público, así que Actions ya no se factura, y el badge apuntaba a un repositorio inexistente (`fompi/culificador`): corregido junto con los otros 20 enlaces rotos. CI se ejecuta en cada push y PR. |
+| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar ya no deja túneles huérfanos: el nombre sale del dominio del panel, no del hostname, y los túneles con el nombre antiguo se reutilizan. Lo que sigue faltando es un `--cleanup` que liste y borre, con confirmación, los que ya se hubieran acumulado; hoy eso se hace a mano en el panel de Cloudflare. |
 
 **Si vas a usarlo en serio**, lo mínimo antes es fijar Docker y Coolify con
 `--pin-docker` / `--pin-coolify` ([#2](https://github.com/fompi/autounattended-coolify/issues/2))
