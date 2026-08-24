@@ -1,6 +1,6 @@
 # USB de instalación desatendida — Ubuntu Server + Docker + Coolify + Cloudflare Tunnel
 
-[![CI](https://github.com/fompi/culificador/actions/workflows/ci.yml/badge.svg)](https://github.com/fompi/culificador/actions/workflows/ci.yml)
+[![CI](https://github.com/fompi/autounattended-coolify/actions/workflows/ci.yml/badge.svg)](https://github.com/fompi/autounattended-coolify/actions/workflows/ci.yml)
 [![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)](LICENSE)
 [![POSIX sh](https://img.shields.io/badge/shell-POSIX%20sh-89e051.svg)](CONTRIBUTING.md)
 [![Ubuntu 24.04 LTS](https://img.shields.io/badge/Ubuntu-24.04%20LTS-E95420.svg?logo=ubuntu&logoColor=white)](https://ubuntu.com/download/server)
@@ -203,7 +203,7 @@ error. Es un modo de fallo bien documentado — `write_files` y `runcmd` son
 módulos *per-instance*, y cloud-init los omite si cree que ya vio esa instancia,
 cosa que puede pasar cuando el propio autoinstall se entrega por un seed NoCloud
 en el medio de instalación. Los detalles están en la incidencia
-[#1](https://github.com/fompi/culificador/issues/1).
+[#1](https://github.com/fompi/autounattended-coolify/issues/1).
 
 La diferencia de fondo no es qué mecanismo es más bonito, sino cuál es
 **observable cuando falla**. `late-commands` corre en un momento conocido y su
@@ -325,34 +325,34 @@ detalle, las implicaciones y un esbozo de solución.
 
 | | Qué pasa |
 |---|---|
-| [#2](https://github.com/fompi/culificador/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
-| [#3](https://github.com/fompi/culificador/issues/3) | **Secretos que sobreviven.** El token de Cloudflare queda en `/etc/coolify-setup.env`, el del túnel en `tunnel.env`, y las contraseñas en el resumen. Nada se borra. |
-| [#4](https://github.com/fompi/culificador/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
-| [#8](https://github.com/fompi/culificador/issues/8) | `build-usb.sh` no verifica la ISO de entrada. |
-| [#9](https://github.com/fompi/culificador/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
-| [#12](https://github.com/fompi/culificador/issues/12) | La geolocalización de la IP se hace por defecto y sin avisar. |
+| [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
+| [#3](https://github.com/fompi/autounattended-coolify/issues/3) | **Secretos que sobreviven.** El token de Cloudflare queda en `/etc/coolify-setup.env`, el del túnel en `tunnel.env`, y las contraseñas en el resumen. Nada se borra. |
+| [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
+| [#8](https://github.com/fompi/autounattended-coolify/issues/8) | `build-usb.sh` no verifica la ISO de entrada. |
+| [#9](https://github.com/fompi/autounattended-coolify/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
+| [#12](https://github.com/fompi/autounattended-coolify/issues/12) | La geolocalización de la IP se hace por defecto y sin avisar. |
 
 ### Sin verificar
 
 | | Qué pasa |
 |---|---|
-| [#6](https://github.com/fompi/culificador/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. |
-| [#10](https://github.com/fompi/culificador/issues/10) | **x86_64 y arranque BIOS sin verificar**, siendo el destino declarado del proyecto. Todo se ha probado en arm64 con UEFI. |
+| [#6](https://github.com/fompi/autounattended-coolify/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. |
+| [#10](https://github.com/fompi/autounattended-coolify/issues/10) | **x86_64 y arranque BIOS sin verificar**, siendo el destino declarado del proyecto. Todo se ha probado en arm64 con UEFI. |
 
 ### Deuda y operación
 
 | | Qué pasa |
 |---|---|
-| [#5](https://github.com/fompi/culificador/issues/5) | `cloudflared` se instala desde `latest`: dos equipos con la misma ISO acaban distintos. |
-| [#7](https://github.com/fompi/culificador/issues/7) | El registro del primer usuario de Coolify raspa su HTML. Se romperá en alguna actualización. |
-| [#11](https://github.com/fompi/culificador/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
-| [#13](https://github.com/fompi/culificador/issues/13) | Sin versionado real: no se puede saber qué versión instaló un equipo. |
-| [#14](https://github.com/fompi/culificador/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
-| [#15](https://github.com/fompi/culificador/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
+| [#5](https://github.com/fompi/autounattended-coolify/issues/5) | `cloudflared` se instala desde `latest`: dos equipos con la misma ISO acaban distintos. |
+| [#7](https://github.com/fompi/autounattended-coolify/issues/7) | El registro del primer usuario de Coolify raspa su HTML. Se romperá en alguna actualización. |
+| [#11](https://github.com/fompi/autounattended-coolify/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
+| [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Sin versionado real: no se puede saber qué versión instaló un equipo. |
+| [#14](https://github.com/fompi/autounattended-coolify/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
+| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
 
-**Si vas a usarlo en serio**, lo mínimo antes es [#2](https://github.com/fompi/culificador/issues/2),
-[#4](https://github.com/fompi/culificador/issues/4) y
-[#6](https://github.com/fompi/culificador/issues/6): integridad de lo que se
+**Si vas a usarlo en serio**, lo mínimo antes es [#2](https://github.com/fompi/autounattended-coolify/issues/2),
+[#4](https://github.com/fompi/autounattended-coolify/issues/4) y
+[#6](https://github.com/fompi/autounattended-coolify/issues/6): integridad de lo que se
 instala, no quedar expuesto en la LAN, y comprobar que el túnel levanta de
 verdad.
 

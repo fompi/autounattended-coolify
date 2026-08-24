@@ -5,7 +5,7 @@
 Usa los [avisos de seguridad privados][adv] de GitHub. No abras una incidencia
 pública para algo explotable.
 
-[adv]: https://github.com/fompi/culificador/security/advisories/new
+[adv]: https://github.com/fompi/autounattended-coolify/security/advisories/new
 
 Respuesta orientativa: acuse en 72 h, valoración en una semana.
 

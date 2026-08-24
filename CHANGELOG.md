@@ -38,4 +38,4 @@ Versionado [semántico](https://semver.org/lang/es/).
 - `setup.sh`: instalador portable en POSIX sh de Docker, Coolify y el túnel.
 - Plantilla de autoinstall y `build-usb.sh`.
 
-[#1]: https://github.com/fompi/culificador/issues/1
+[#1]: https://github.com/fompi/autounattended-coolify/issues/1
