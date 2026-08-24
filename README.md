@@ -396,6 +396,26 @@ conserva tal cual, y `--installer-user=NOMBRE` sirve si le pusiste otro nombre.
   los necesita.
 - **Secretos en `ps`.** Un `--cf-token=xxx` literal es visible para otros
   usuarios de la máquina. Usa `@fichero`, `@-` o la variable de entorno.
+- **Reinstalar no duplica el túnel.** El nombre del túnel sale del dominio del
+  panel (`coolify-coolify.tudominio.tld`), no del hostname: formatear el mini PC
+  y reinstalarlo con otro nombre de máquina reutiliza el mismo túnel en vez de
+  crear uno nuevo y dejar el viejo huérfano apuntando a nada. Las instalaciones
+  anteriores, que sí lo nombraban con el hostname, se detectan y se reutilizan
+  tal cual: no se renombran ni se duplican. El nombre queda anotado en
+  `tunnel.env` y en el resumen, para poder identificar después qué túnel de la
+  cuenta es el de este equipo. **Nada se borra solo en Cloudflare**, tampoco con
+  `--reset`: si abandonas un despliegue, el túnel y los CNAME hay que quitarlos a
+  mano desde el panel de Cloudflare.
+- **El túnel se comprueba conectado, no arrancado.** `systemctl is-active` no
+  basta: `cloudflared` arranca y reintenta en bucle aunque el token no valga, así
+  que «activo» no significa «conectado». El paso le pregunta a Cloudflare por el
+  estado del túnel y espera a que sea `healthy` (acepta `degraded` —conecta y pasa
+  tráfico, con menos conexiones al edge de las esperadas— pero avisa). El tiempo
+  máximo son 120 s, ajustables con `TUNNEL_HEALTH_TIMEOUT`. Si no conecta, el
+  mensaje distingue las tres causas, que tienen tres soluciones distintas: sin
+  salida a internet, cortafuegos de salida bloqueando el puerto 7844, o token del
+  túnel que no vale. Si no se puede ni preguntar, avisa y sigue: no conviene
+  inventarse un modo de fallo tardío por no haber podido comprobar nada.
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
   una app en Coolify le pones un dominio con ese patrón y funciona sin tocar DNS.
 
@@ -416,7 +436,7 @@ detalle, las implicaciones y un esbozo de solución.
 
 | | Qué pasa |
 |---|---|
-| [#6](https://github.com/fompi/autounattended-coolify/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. |
+| [#6](https://github.com/fompi/autounattended-coolify/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. La comprobación ya no se conforma con `is-active` —pregunta a Cloudflare si el túnel está conectado, con reintentos y diagnóstico—, pero la conexión al edge real sigue sin ejercitarse. |
 | [#10](https://github.com/fompi/autounattended-coolify/issues/10) | **x86_64 y arranque BIOS sin verificar**, siendo el destino declarado del proyecto. Todo se ha probado en arm64 con UEFI. |
 
 ### Deuda y operación
@@ -428,7 +448,7 @@ detalle, las implicaciones y un esbozo de solución.
 | [#11](https://github.com/fompi/autounattended-coolify/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
 | [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Sin versionado real: no se puede saber qué versión instaló un equipo. |
 | [#14](https://github.com/fompi/autounattended-coolify/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
-| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
+| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar ya no deja túneles huérfanos: el nombre sale del dominio, no del hostname. Lo que sigue faltando es un `--cleanup` que liste y borre, con confirmación, los túneles muertos que ya se hubieran acumulado; hoy eso se hace a mano en el panel de Cloudflare. |
 
 **Si vas a usarlo en serio**, lo mínimo antes es [#2](https://github.com/fompi/autounattended-coolify/issues/2),
 [#4](https://github.com/fompi/autounattended-coolify/issues/4) y
@@ -490,6 +510,12 @@ Probado ejecutándolo, no solo leyéndolo.
 - Flujo de resolución completo contra una API de Cloudflare simulada:
   descubrimiento de zona, menú multi-zona, derivación de hostname, email y
   zona horaria, creación de túnel, ingress y registros DNS.
+- Reejecutar con otro hostname contra la API simulada deja **un solo túnel** en
+  la cuenta, y un túnel con el nombre antiguo se reutiliza en vez de duplicarse.
+- Espera a que el túnel aparezca conectado: reintenta mientras Cloudflare
+  responde `inactive`, acepta `degraded`, y **falla** si nunca conecta, dentro
+  del tiempo máximo configurado. Lo que no se puede probar aquí es la conexión
+  real de `cloudflared` contra el edge.
 - Precedencia argumentos > configuración guardada > derivado > preguntar.
 - Idempotencia y reintento de pasos.
 - Prompts vía `/dev/tty` con el script canalizado (`curl | sh`).

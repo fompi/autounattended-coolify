@@ -7,10 +7,14 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer resolution build latecommands
+# Grupos: syntax json validators timezone secrets installer resolution tunnel
+#         build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
-# la ISO, y el paso tunnel_service (habla con el edge real de Cloudflare).
+# la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
+# que si se cubre del tunel es el resto: la logica de espera, reintento y
+# fallo del paso tunnel_service, y el nombre estable del tunel entre
+# reinstalaciones, todo contra el simulador.
 
 set -eu
 
@@ -45,7 +49,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer resolution build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -267,6 +271,7 @@ fake_config() {
     ROOT_DOMAIN='fompi.net'
     APP_WILDCARD='*.app.fompi.net'
     TUNNEL_ID='tid'
+    TUNNEL_NAME='coolify-coolify.fompi.net'
     INSTALLER_USER='installer'
     INSTALLER_STATE='bloqueada, fuera de sudo y con shell /usr/sbin/nologin'
     LOG_FILE="$SEC/log"
@@ -298,6 +303,16 @@ esac
 case "$(cat "$SUMMARY_FILE")" in
     *'Cuenta de rescate'*'fuera de sudo'*) ok "el resumen dice como quedo la cuenta de rescate" ;;
     *) bad "el resumen dice como quedo la cuenta de rescate" ;;
+esac
+# Sin el nombre del tunel no hay forma de saber luego cual de los de la cuenta
+# es el de este equipo (#15).
+case "$(cat "$SUMMARY_FILE")" in
+    *'coolify-coolify.fompi.net'*) ok "el resumen dice como se llama el tunel" ;;
+    *) bad "el resumen dice como se llama el tunel" ;;
+esac
+case "$(cat "$SUMMARY_FILE")" in
+    *'tampoco con --reset'*) ok "y avisa de que --reset no borra nada en Cloudflare" ;;
+    *) bad "y avisa de que --reset no borra nada en Cloudflare" ;;
 esac
 if have stat; then
     for f in "$SUMMARY_FILE" "$CREDS_FILE"; do
@@ -565,6 +580,302 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
     fi
 
     kill "$MOCK_PID" 2>/dev/null; MOCK_PID=''
+fi
+fi
+
+# ----------------------------------------------------------------- tunel
+if want tunnel; then
+group "Tunel: conectado de verdad (#6) y nombre estable (#15)"
+if ! have python3; then
+    skip "grupo entero" "hace falta python3 para el simulador"
+else
+    # mock_up PUERTO [args...] — arranca el simulador y espera a que escuche.
+    mock_up() {
+        _mp=$1; shift
+        python3 "$HERE/cf-mock.py" "$_mp" "$@" >>"$TMP/mock-tunnel.log" 2>&1 &
+        MOCK_PID=$!
+        _i=0
+        while [ $_i -lt 100 ]; do
+            if python3 -c "import socket,sys
+s = socket.socket(); s.settimeout(0.2)
+sys.exit(0 if s.connect_ex(('127.0.0.1', $_mp)) == 0 else 1)" 2>/dev/null; then
+                return 0
+            fi
+            _i=$((_i+1)); sleep 0.1
+        done
+        return 1
+    }
+    mock_down() {
+        [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null
+        MOCK_PID=''
+    }
+    # api METODO RUTA [CUERPO] -> cuerpo por stdout. Para preparar y comprobar
+    # el estado del simulador sin pasar por setup.sh.
+    api() {
+        python3 - "$1" "http://127.0.0.1:$PORT$2" "${3:-}" <<'PYEOF'
+import sys, urllib.request, urllib.error
+m, url, body = sys.argv[1], sys.argv[2], sys.argv[3]
+req = urllib.request.Request(url, data=body.encode() if body else None, method=m,
+                             headers={"Authorization": "Bearer GOODTOKEN",
+                                      "Content-Type": "application/json"})
+try:
+    sys.stdout.write(urllib.request.urlopen(req, timeout=10).read().decode())
+except urllib.error.HTTPError as e:
+    sys.stdout.write(e.read().decode())
+PYEOF
+    }
+    jget() { python3 -c "import json,sys;d=json.load(sys.stdin)$1;print(d)"; }
+
+    # Las funciones de verificacion, sueltas: son puras salvo por la llamada
+    # HTTP, y asi se prueban de verdad contra el simulador en vez de comprobar
+    # que el texto del script menciona una URL.
+    load_tunnel_fns() {
+        eval "$(awk '/^JSON_PY=.$/,/^.$/' "$ROOT/setup.sh")"
+        eval "$(sed -n '/^json_get() {/,/^}/p' "$ROOT/setup.sh")"
+        eval "$(sed -n '/^cf_api() {/,/^}/p' "$ROOT/setup.sh")"
+        eval "$(sed -n '/^tunnel_status() {/,/^}/p' "$ROOT/setup.sh")"
+        eval "$(sed -n '/^wait_tunnel_healthy() {/,/^}/p' "$ROOT/setup.sh")"
+        eval "$(sed -n '/^tcp_probe() {/,/^}/p' "$ROOT/setup.sh")"
+        setup_json() { :; }
+    }
+    load_tunnel_fns
+    # Consumidas por las funciones cargadas con eval, que el analizador no ve.
+    # shellcheck disable=SC2034
+    PY=python3
+    # shellcheck disable=SC2034
+    JSON_MODE=py
+    # shellcheck disable=SC2034
+    UA=pruebas
+    # shellcheck disable=SC2034
+    CF_TOKEN=GOODTOKEN
+    # shellcheck disable=SC2034
+    ACCOUNT_ID=acct-1
+    # shellcheck disable=SC2034
+    HTTP=python3
+    # shellcheck disable=SC2034
+    have curl && HTTP=curl
+
+    # Un sondeo unico con suerte no prueba nada: hace falta que el tunel tarde
+    # en conectar y que la espera aguante. flaky:3 = tres 'inactive' y luego si.
+    PORT=8801
+    if ! mock_up "$PORT" --tunnel-status flaky:3; then
+        bad "el simulador arranca (flaky)" "no llego a escuchar en $PORT"
+    else
+        CF_API="http://127.0.0.1:$PORT"
+        TUNNEL_ID=$(api POST /accounts/acct-1/cfd_tunnel '{"name":"coolify-x"}' | jget '["result"]["id"]')
+        TUNNEL_HEALTH_TIMEOUT=6; TUNNEL_HEALTH_INTERVAL=1
+        st=0; wait_tunnel_healthy || st=$?
+        is "con reintentos acaba viendolo conectado" "0" "$st"
+        is "y se queda con el estado bueno" "healthy" "$TUNNEL_HEALTH"
+        n=$(api GET /__state | jget '["result"]["status_queries"]')
+        if [ "$n" -ge 4 ]; then
+            ok "consulto $n veces: hubo reintentos de verdad"
+        else
+            bad "hubo reintentos de verdad" "solo $n consultas"
+        fi
+        mock_down
+    fi
+
+    # Token que no vale: el tunel nunca conecta. El paso tiene que FALLAR, y
+    # hacerlo dentro del tiempo maximo, no colgarse.
+    PORT=8802
+    if ! mock_up "$PORT" --tunnel-status inactive; then
+        bad "el simulador arranca (inactive)" "no llego a escuchar en $PORT"
+    else
+        CF_API="http://127.0.0.1:$PORT"
+        TUNNEL_ID=$(api POST /accounts/acct-1/cfd_tunnel '{"name":"coolify-x"}' | jget '["result"]["id"]')
+        TUNNEL_HEALTH_TIMEOUT=2; TUNNEL_HEALTH_INTERVAL=1
+        t0=$(date +%s)
+        st=0; wait_tunnel_healthy || st=$?
+        t1=$(date +%s)
+        is "si nunca conecta, el paso falla" "1" "$st"
+        is "y no da por bueno el 'inactive'" "inactive" "$TUNNEL_HEALTH"
+        if [ $((t1 - t0)) -le 20 ]; then
+            ok "respeta el tiempo maximo configurado ($((t1 - t0))s)"
+        else
+            bad "respeta el tiempo maximo configurado" "tardo $((t1 - t0))s con TUNNEL_HEALTH_TIMEOUT=2"
+        fi
+        # tcp_probe distingue un puerto que escucha de uno que no: es lo que
+        # separa 'cortafuegos de salida' de 'token invalido' en el diagnostico.
+        st=0; tcp_probe 127.0.0.1 "$PORT" || st=$?
+        is "tcp_probe ve el puerto abierto" "0" "$st"
+        mock_down
+        st=0; tcp_probe 127.0.0.1 "$PORT" || st=$?
+        is "tcp_probe ve el puerto cerrado" "1" "$st"
+    fi
+
+    # 'degraded' conecta y pasa trafico: vale, pero hay que avisar.
+    PORT=8803
+    if ! mock_up "$PORT" --tunnel-status degraded; then
+        bad "el simulador arranca (degraded)" "no llego a escuchar en $PORT"
+    else
+        CF_API="http://127.0.0.1:$PORT"
+        TUNNEL_ID=$(api POST /accounts/acct-1/cfd_tunnel '{"name":"coolify-x"}' | jget '["result"]["id"]')
+        TUNNEL_HEALTH_TIMEOUT=2; TUNNEL_HEALTH_INTERVAL=1
+        st=0; wait_tunnel_healthy || st=$?
+        is "'degraded' se acepta" "0" "$st"
+        is "pero queda registrado como tal" "degraded" "$TUNNEL_HEALTH"
+        mock_down
+    fi
+
+    # Si no se puede ni preguntar, se avisa; abortar aqui seria inventarse un
+    # tercer modo de fallo tardio por no haber podido comprobar nada.
+    # shellcheck disable=SC2034
+    CF_API="http://127.0.0.1:8804"
+    # shellcheck disable=SC2034
+    TUNNEL_ID=no-existe
+    # shellcheck disable=SC2034
+    TUNNEL_HEALTH_TIMEOUT=0
+    # shellcheck disable=SC2034
+    TUNNEL_HEALTH_INTERVAL=1
+    st=0; wait_tunnel_healthy || st=$?
+    is "sin API que responda: ni bien ni fallo, indeterminado" "2" "$st"
+
+    # Invariantes del paso, sobre el texto: lo que no se puede ejecutar aqui.
+    sed -n '/^do_tunnel_service() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/svc.sh"
+    if grep -q 'wait_tunnel_healthy' "$TMP/svc.sh"; then
+        ok "el paso no se conforma con 'systemctl is-active'"
+    else
+        bad "el paso no se conforma con 'systemctl is-active'" "no llama a wait_tunnel_healthy"
+    fi
+    if grep -q 'sleep 5' "$TMP/svc.sh"; then
+        bad "ya no hay 'sleep 5 y a ver que dice is-active'" "sigue el sleep a ciegas"
+    else
+        ok "ya no hay 'sleep 5 y a ver que dice is-active'"
+    fi
+    # El segundo falso positivo: un cloudflared vivo del intento anterior, con
+    # el token de OTRO tunel, no puede darse por bueno.
+    if grep -q 'cloudflared_runs_our_tunnel' "$TMP/svc.sh"; then
+        ok "la rama 'ya esta corriendo' comprueba de que tunel es"
+    else
+        bad "la rama 'ya esta corriendo' comprueba de que tunel es"
+    fi
+    sed -n '/^cloudflared_runs_our_tunnel() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/runs.sh"
+    if grep -q 'TUNNEL_TOKEN' "$TMP/runs.sh"; then
+        ok "y lo comprueba por el token instalado en la unidad"
+    else
+        bad "y lo comprueba por el token instalado en la unidad"
+    fi
+    # Tres causas, tres soluciones. Sin distinguirlas el usuario culpa al token.
+    sed -n '/^tunnel_diagnose() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/diag.sh"
+    for pat in 'salida a internet' '7844' 'token del'; do
+        if grep -q "$pat" "$TMP/diag.sh"; then
+            ok "el diagnostico distingue '$pat'"
+        else
+            bad "el diagnostico distingue '$pat'"
+        fi
+    done
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *TUNNEL_HEALTH_TIMEOUT*) ok "TUNNEL_HEALTH_TIMEOUT aparece en la ayuda" ;;
+        *) bad "TUNNEL_HEALTH_TIMEOUT aparece en la ayuda" ;;
+    esac
+
+    # ---- #15: el nombre del tunel no puede depender del hostname ----------
+    eval "$(sed -n '/^tunnel_name() {/,/^}/p' "$ROOT/setup.sh")"
+    is "el nombre sale del FQDN del panel" "coolify-coolify.fompi.net" \
+        "$(tunnel_name coolify.fompi.net)"
+    is "no depende del hostname" "$(tunnel_name coolify.fompi.net)" \
+        "$(tunnel_name coolify.fompi.net)"
+    is "en minusculas" "coolify-panel.fompi.net" "$(tunnel_name PANEL.Fompi.NET)"
+    largo=$(tunnel_name "$(printf 'abcdefghij%.0s' 1 2 3 4 5 6 7 8).net")
+    is "recortado al limite de Cloudflare" "63" "${#largo}"
+    case "$(tunnel_name 'raro/$ nombre.net')" in
+        *' '*|*'/'*|*'$'*) bad "descarta los caracteres que no valen" ;;
+        *) ok "descarta los caracteres que no valen" ;;
+    esac
+    case "$(tunnel_name coolify.fompi.net)" in
+        coolify-*) ok "lleva prefijo reconocible" ;;
+        *) bad "lleva prefijo reconocible" ;;
+    esac
+
+    # Llegar al paso del tunel sin ser root: se premarcan los pasos que tocan
+    # el sistema (antes y despues) y se deja correr el resto de verdad. Es mas
+    # honesto que probar la funcion suelta, porque se ejerce el script entero:
+    # resolucion, creacion del tunel, ingress y DNS contra el simulador.
+    HOMEDIR="$TMP/home"; mkdir -p "$HOMEDIR"
+    run_hasta_tunel() { # run_hasta_tunel DIRESTADO ARGS...
+        _sd=$1; shift
+        mkdir -p "$_sd/coolify-setup"
+        for _st in wifi hostname timezone admin_user docker coolify \
+                   coolify_domain coolify_register cloudflared_bin \
+                   tunnel_service retire_installer; do
+            : > "$_sd/coolify-setup/step.$_st"
+        done
+        env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$_sd" \
+            HOME="$HOMEDIR" NO_COLOR=1 NO_GEOIP=1 \
+            sh "$ROOT/setup.sh" "$@" 2>&1 || true
+    }
+    n_tuneles() { api GET /accounts/acct-1/cfd_tunnel | jget '["result_info"]["count"]'; }
+    nombres_tuneles() { api GET /accounts/acct-1/cfd_tunnel \
+        | python3 -c 'import json,sys;print(",".join(sorted(t["name"] for t in json.load(sys.stdin)["result"])))'; }
+
+    PORT=8805
+    if ! mock_up "$PORT"; then
+        bad "el simulador arranca (#15)" "no llego a escuchar en $PORT"
+    else
+        # El listado sin filtro tiene que devolver lo que hay, no una lista
+        # vacia: es como se comprueba que no quedan tuneles huerfanos.
+        is "el simulador parte sin tuneles" "0" "$(n_tuneles)"
+
+        out=$(run_hasta_tunel "$TMP/i1" --cf-token=GOODTOKEN --domain=fompi.net \
+            --hostname=primera --non-interactive --keep-secrets)
+        is "primera instalacion: un tunel" "1" "$(n_tuneles)"
+        is "con el nombre derivado del FQDN" "coolify-coolify.fompi.net" "$(nombres_tuneles)"
+        case "$out" in
+            *"Túnel creado"*) ok "la primera lo crea" ;;
+            *) bad "la primera lo crea" "$(printf '%s' "$out" | tail -3)" ;;
+        esac
+        if grep -q "TUNNEL_NAME='coolify-coolify.fompi.net'" "$TMP/i1/coolify-setup/tunnel.env"; then
+            ok "el nombre queda anotado en tunnel.env"
+        else
+            bad "el nombre queda anotado en tunnel.env" \
+                "$(sed 's/=.*/=.../' "$TMP/i1/coolify-setup/tunnel.env" 2>/dev/null)"
+        fi
+
+        # Lo de #15: reinstalar el mismo despliegue con otro hostname. Antes
+        # esto dejaba el tunel viejo huerfano en la cuenta.
+        out=$(run_hasta_tunel "$TMP/i2" --cf-token=GOODTOKEN --domain=fompi.net \
+            --hostname=segunda --non-interactive --keep-secrets)
+        is "cambiar el hostname NO crea un tunel nuevo" "1" "$(n_tuneles)"
+        is "y sigue siendo el mismo" "coolify-coolify.fompi.net" "$(nombres_tuneles)"
+        case "$out" in
+            *"Reutilizando el túnel existente"*) ok "lo dice: reutiliza el existente" ;;
+            *) bad "lo dice: reutiliza el existente" "$(printf '%s' "$out" | tail -3)" ;;
+        esac
+        mock_down
+    fi
+
+    # Compatibilidad hacia atras: una instalacion anterior a #15 tiene el tunel
+    # con el nombre viejo. Hay que reutilizarlo, no crear otro al lado: los
+    # CNAME en uso apuntan a ese.
+    PORT=8806
+    if ! mock_up "$PORT"; then
+        bad "el simulador arranca (heredado)" "no llego a escuchar en $PORT"
+    else
+        api POST /accounts/acct-1/cfd_tunnel '{"name":"coolify-vieja"}' >/dev/null
+        is "el simulador tiene el tunel heredado" "1" "$(n_tuneles)"
+        out=$(run_hasta_tunel "$TMP/i3" --cf-token=GOODTOKEN --domain=fompi.net \
+            --hostname=vieja --non-interactive --keep-secrets)
+        is "no se crea uno al lado del heredado" "1" "$(n_tuneles)"
+        is "se conserva el nombre heredado" "coolify-vieja" "$(nombres_tuneles)"
+        case "$out" in
+            *"heredado"*) ok "lo dice: reutiliza el heredado" ;;
+            *) bad "lo dice: reutiliza el heredado" "$(printf '%s' "$out" | tail -3)" ;;
+        esac
+        if grep -q "TUNNEL_NAME='coolify-vieja'" "$TMP/i3/coolify-setup/tunnel.env"; then
+            ok "y anota el nombre que se usa de verdad"
+        else
+            bad "y anota el nombre que se usa de verdad"
+        fi
+        mock_down
+    fi
+
+    # --reset borra estado local; que no se entienda que limpia Cloudflare.
+    ayuda=$(sh "$ROOT/setup.sh" --help 2>&1)
+    case "$ayuda" in
+        *'--reset'*'No toca'*'Cloudflare'*) ok "la ayuda de --reset dice que no toca Cloudflare" ;;
+        *) bad "la ayuda de --reset dice que no toca Cloudflare" ;;
+    esac
 fi
 fi
 

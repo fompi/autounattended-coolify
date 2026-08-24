@@ -143,7 +143,10 @@ CONTROL
   --skip-docker          No instalar Docker.
   --skip-coolify         No instalar Coolify.
   --skip-tunnel          No crear el túnel de Cloudflare.
-  --reset                Olvidar el estado previo y empezar de cero.
+  --reset                Olvidar el estado LOCAL y empezar de cero. No toca
+                         nada en Cloudflare: el túnel y los CNAME siguen ahí y
+                         se reutilizan al reejecutar. Tampoco desinstala Docker
+                         ni Coolify.
   --keep-secrets         No borrar al terminar los ficheros con el token de
                          Cloudflare, el del túnel y la configuración resuelta.
   --summary-no-secrets   No imprimir contraseñas por pantalla al terminar; se
@@ -154,6 +157,11 @@ CONTROL
                          vez de bloquearla.
   --dry-run              Mostrar la configuración resuelta y salir.
   -h, --help             Esta ayuda.
+
+ENTORNO
+  TUNNEL_HEALTH_TIMEOUT  Segundos que se espera a que Cloudflare vea el túnel
+                         conectado antes de dar el paso por fallido. Def.: 120.
+  TUNNEL_HEALTH_INTERVAL Segundos entre consultas de ese estado. Def.: 5.
 
 SEGURIDAD
   Los secretos pasados como --flag=valor son visibles en 'ps'. Prefiere las
@@ -602,6 +610,19 @@ valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
 
+# Nombre del túnel a partir del FQDN del panel. NO del hostname: reinstalar el
+# mini PC con otro hostname creaba un túnel nuevo y dejaba el viejo huérfano en
+# la cuenta, apuntando a una máquina que ya no existe (#15). Lo que identifica
+# de verdad el despliegue es el dominio donde se publica, que sobrevive al
+# formateo. El prefijo 'coolify-' hace reconocible lo que creamos nosotros, y
+# el recorte a 63 es el límite de Cloudflare.
+tunnel_name() {
+    printf '%s' "coolify-$1" \
+        | tr 'A-Z' 'a-z' \
+        | sed 's/[^a-z0-9.-]/-/g' \
+        | cut -c1-63
+}
+
 # Zona horaria que ya tiene el sistema, por stdout; cadena vacía si no hay.
 # El parámetro RAIZ solo existe para poder probar la función contra un /etc
 # simulado: en producción se llama sin argumentos. Eso es justo lo que detecta
@@ -942,6 +963,7 @@ fi
 
 APP_WILDCARD="*.$APP_SUBDOMAIN.$ROOT_DOMAIN"
 COOLIFY_FQDN="$COOLIFY_SUBDOMAIN.$ROOT_DOMAIN"
+TUNNEL_NAME=$(tunnel_name "$COOLIFY_FQDN")
 
 # --- Guardar configuración resuelta para reintentos ----------------------
 save_config() {
@@ -982,6 +1004,7 @@ CONFIG_SUMMARY="Configuración resuelta:
   Apps .............. https://$APP_WILDCARD  ->  localhost:80
   Panel Coolify ..... https://$COOLIFY_FQDN  ->  localhost:8000
   Email Coolify ..... $COOLIFY_EMAIL
+  Túnel ............. $TUNNEL_NAME (se reutiliza si ya existe)
 
   Contraseñas generadas automáticamente; al terminar quedan en
   $CREDS_FILE (modo 0600), no en el resumen."
@@ -1228,16 +1251,37 @@ TUNNEL_FILE="$STATE_DIR/tunnel.env"
 # shellcheck source=/dev/null
 [ -f "$TUNNEL_FILE" ] && . "$TUNNEL_FILE"
 
+# ID del túnel que se llame exactamente así, o vacío si no hay ninguno.
+tunnel_id_by_name() {
+    cf_call GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$1&is_deleted=false" 2>/dev/null \
+        | json_get '.result[0].id' || true
+}
+
 do_tunnel_create() {
     [ -n "$SKIP_TUNNEL" ] && return 0
-    tname="coolify-$NEW_HOSTNAME"
+    tname=$TUNNEL_NAME
+    # Como se llamaba antes de #15. Sigue habiendo instalaciones con ese nombre.
+    legacy="coolify-$NEW_HOSTNAME"
 
-    # Reutilizar el túnel si ya existe con ese nombre (reintentos limpios).
-    existing=$(cf_call GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$tname&is_deleted=false" 2>/dev/null \
-        | json_get '.result[0].id' || true)
+    # Reutilizar el túnel si ya existe con ese nombre (reintentos limpios, y
+    # reinstalaciones del mismo despliegue).
+    existing=$(tunnel_id_by_name "$tname")
+    if [ -n "$existing" ]; then
+        note "Reutilizando el túnel existente '$tname'"
+    elif [ "$legacy" != "$tname" ]; then
+        # Compatibilidad hacia atrás: si el despliegue ya tiene túnel con el
+        # nombre viejo, se reutiliza ESE. Crear uno nuevo al lado dejaría
+        # huérfano justo el que está en uso, que es el problema de #15 al revés.
+        existing=$(tunnel_id_by_name "$legacy")
+        if [ -n "$existing" ]; then
+            tname=$legacy
+            note "Reutilizando el túnel heredado '$legacy' (nombre anterior a #15)."
+            note "No se renombra ni se crea otro: los CNAME en uso apuntan a este."
+        fi
+    fi
+
     if [ -n "$existing" ]; then
         TUNNEL_ID=$existing
-        note "Reutilizando el túnel existente '$tname'"
         tok=$(cf_call GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" | json_get '.result') || return 1
         TUNNEL_TOKEN=$tok
     else
@@ -1245,11 +1289,16 @@ do_tunnel_create() {
         resp=$(cf_call POST "/accounts/$ACCOUNT_ID/cfd_tunnel" "$body") || return 1
         TUNNEL_ID=$(printf '%s' "$resp" | json_get '.result.id')
         TUNNEL_TOKEN=$(printf '%s' "$resp" | json_get '.result.token')
+        note "Túnel creado: $tname"
     fi
     [ -n "$TUNNEL_ID" ] && [ -n "$TUNNEL_TOKEN" ] || { err "No se obtuvo el ID/token del túnel."; return 1; }
 
+    TUNNEL_NAME=$tname
     umask 077
-    printf "TUNNEL_ID='%s'\nTUNNEL_TOKEN='%s'\n" "$TUNNEL_ID" "$TUNNEL_TOKEN" > "$TUNNEL_FILE"
+    # El nombre se anota a propósito: es lo que permite identificar después qué
+    # túnel de la cuenta creamos nosotros y para qué despliegue.
+    printf "TUNNEL_ID='%s'\nTUNNEL_NAME='%s'\nTUNNEL_TOKEN='%s'\n" \
+        "$TUNNEL_ID" "$TUNNEL_NAME" "$TUNNEL_TOKEN" > "$TUNNEL_FILE"
     chmod 600 "$TUNNEL_FILE"
 }
 run_step tunnel_create "Túnel de Cloudflare" do_tunnel_create
@@ -1284,21 +1333,163 @@ do_dns() {
 }
 run_step dns "Registros DNS" do_dns
 
+# Cuánto esperar a que Cloudflare reconozca el túnel como conectado. En un
+# equipo real la primera conexión al edge tarda segundos; el margen es para
+# redes lentas. Se acorta por entorno (la suite lo hace: 120 s de espera en
+# cada prueba serían insoportables).
+TUNNEL_HEALTH_TIMEOUT="${TUNNEL_HEALTH_TIMEOUT:-120}"
+TUNNEL_HEALTH_INTERVAL="${TUNNEL_HEALTH_INTERVAL:-5}"
+case "$TUNNEL_HEALTH_TIMEOUT" in ''|*[!0-9]*) TUNNEL_HEALTH_TIMEOUT=120 ;; esac
+case "$TUNNEL_HEALTH_INTERVAL" in ''|*[!0-9]*|0) TUNNEL_HEALTH_INTERVAL=5 ;; esac
+TUNNEL_HEALTH=''
+
+# Estado del túnel SEGÚN CLOUDFLARE, que es el único que sabe si hay conexiones
+# vivas contra el edge. Sale vacío y con rc!=0 si no se ha podido preguntar.
+# Se usa cf_api y no cf_call a propósito: esto se consulta en bucle y cf_call
+# escupiría un error por cada intento fallido.
+tunnel_status() {
+    ts_out=$(cf_api GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID" 2>/dev/null) || return 1
+    [ "$(printf '%s' "$ts_out" | json_get '.success')" = "true" ] || return 1
+    printf '%s' "$ts_out" | json_get '.result.status'
+}
+
+# Espera a que el túnel aparezca conectado. Devuelve:
+#   0  conectado: 'healthy', o 'degraded' (conecta y pasa tráfico, pero con
+#      menos conexiones al edge de las esperadas: se avisa, no se aborta).
+#   1  Cloudflare contesta y dice que NO está conectado -> fallo de verdad.
+#   2  no se ha podido saber -> avisar, nunca abortar: un tercer modo de fallo
+#      tardío por no haber podido preguntar sería peor que el problema.
+wait_tunnel_healthy() {
+    _wt_left=$TUNNEL_HEALTH_TIMEOUT
+    _wt_seen=''
+    TUNNEL_HEALTH=''
+    while :; do
+        if _wt_st=$(tunnel_status) && [ -n "$_wt_st" ]; then
+            _wt_seen=1
+            TUNNEL_HEALTH=$_wt_st
+            case "$_wt_st" in
+                healthy|degraded) return 0 ;;
+            esac
+        fi
+        [ "$_wt_left" -gt 0 ] || break
+        sleep "$TUNNEL_HEALTH_INTERVAL"
+        _wt_left=$(( _wt_left - TUNNEL_HEALTH_INTERVAL ))
+    done
+    [ -n "$_wt_seen" ] || return 2
+    return 1
+}
+
+# ¿Se puede abrir una conexión TCP a HOST:PUERTO? 0 sí, 1 no, 2 no se sabe.
+# El 2 importa: sin herramienta con la que comprobarlo no se puede afirmar que
+# haya un cortafuegos, y acusar en falso manda al usuario por el camino malo.
+tcp_probe() {
+    if have python3 || have python; then
+        tp_py=python3; have python3 || tp_py=python
+        "$tp_py" - "$1" "$2" <<'PYEOF' && return 0 || return 1
+import socket, sys
+s = socket.socket()
+s.settimeout(8)
+sys.exit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) == 0 else 1)
+PYEOF
+    fi
+    if have nc; then
+        nc -z -w 8 "$1" "$2" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    return 2
+}
+
+# Un túnel que no conecta tiene tres causas con tres soluciones distintas. Si no
+# se distinguen, el usuario culpa al token —lo único que ha tecleado— y se queda
+# mirando ahí mientras el problema está en la red.
+tunnel_diagnose() {
+    err "Cloudflare no ve el túnel conectado (estado: ${TUNNEL_HEALTH:-desconocido})."
+    if ! cf_api GET /user/tokens/verify >/dev/null 2>&1; then
+        err "Causa más probable: este equipo no tiene salida a internet."
+        note "No se llega ni a la API de Cloudflare, que hace un momento respondía."
+        note "Revisa el cable o la WiFi, la ruta por defecto (ip route) y el DNS."
+        return 0
+    fi
+    note "Salida a internet: la hay, la API de Cloudflare responde."
+    tp_rc=0; tcp_probe region1.v2.argotunnel.com 7844 || tp_rc=$?
+    case "$tp_rc" in
+        0) note "Edge de Cloudflare: alcanzable en el puerto 7844." ;;
+        1)
+            err "Causa más probable: un cortafuegos de salida bloquea el puerto 7844."
+            note "cloudflared no usa el 443: abre la conexión al edge por el 7844 (QUIC"
+            note "sobre UDP, con TCP como alternativa). Con el 7844 cerrado el servicio"
+            note "arranca igual y reintenta en bucle, que es justo lo que está pasando."
+            note "Abre el 7844 de salida hacia *.argotunnel.com (UDP y TCP)."
+            return 0
+            ;;
+        *) warn "No se ha podido comprobar el puerto 7844: no hay python ni nc." ;;
+    esac
+    err "Causa más probable: el token del túnel no vale para este túnel."
+    note "El servicio arranca igual con un token que no sirve y reintenta en bucle;"
+    note "por eso 'systemctl is-active' decía que sí. El motivo real está en:"
+    note "  journalctl -u cloudflared -n 50 --no-pager"
+    note "Para rehacer el túnel desde cero, borra estos dos y vuelve a ejecutar:"
+    note "  $STATE_DIR/step.tunnel_create   $TUNNEL_FILE"
+}
+
+# Cierto solo si el cloudflared que está corriendo lleva el token de ESTE túnel.
+# Un cloudflared 'activo' puede ser el del intento anterior, con el token de
+# otro túnel: darlo por bueno es el segundo falso positivo de #6, y deja una
+# instalación que parece terminada y no publica nada.
+cloudflared_runs_our_tunnel() {
+    [ -n "$HAS_SYSTEMD" ] || return 1
+    [ -n "${TUNNEL_TOKEN:-}" ] || return 1
+    systemctl is-active --quiet cloudflared 2>/dev/null || return 1
+    systemctl cat cloudflared 2>/dev/null | grep -qF -- "$TUNNEL_TOKEN"
+}
+
 do_tunnel_service() {
     [ -n "$SKIP_TUNNEL" ] && return 0
     need_root || return 1
     [ -n "$CLOUDFLARED_BIN" ] || { err "No hay binario de cloudflared."; return 1; }
-    if [ -n "$HAS_SYSTEMD" ] && systemctl is-active --quiet cloudflared 2>/dev/null; then
-        ok "cloudflared ya está corriendo"
-        return 0
+    [ -n "${TUNNEL_TOKEN:-}" ] || { err "No hay token del túnel; falta el paso tunnel_create."; return 1; }
+
+    if cloudflared_runs_our_tunnel; then
+        note "cloudflared ya corre con el token de este túnel; no se reinstala"
+    else
+        if [ -n "$HAS_SYSTEMD" ] && systemctl is-active --quiet cloudflared 2>/dev/null; then
+            warn "Hay un cloudflared activo que no lleva el token de este túnel: será de un"
+            warn "intento anterior. Se reinstala el servicio con el token correcto."
+        fi
+        "$CLOUDFLARED_BIN" service uninstall >/dev/null 2>&1 || true
+        "$CLOUDFLARED_BIN" service install "$TUNNEL_TOKEN" || return 1
+        [ -n "$HAS_SYSTEMD" ] && { systemctl enable --now cloudflared || return 1; }
     fi
-    "$CLOUDFLARED_BIN" service uninstall >/dev/null 2>&1 || true
-    "$CLOUDFLARED_BIN" service install "$TUNNEL_TOKEN" || return 1
-    if [ -n "$HAS_SYSTEMD" ]; then
-        systemctl enable --now cloudflared || return 1
-        sleep 5
-        systemctl is-active --quiet cloudflared || { err "cloudflared no arrancó."; return 1; }
+
+    if [ -n "$HAS_SYSTEMD" ] && ! systemctl is-active --quiet cloudflared; then
+        err "El servicio cloudflared no está activo."
+        note "Mira por qué con: journalctl -u cloudflared -n 50 --no-pager"
+        return 1
     fi
+
+    # 'activo' no es 'conectado'. Quien sabe si hay conexiones vivas contra el
+    # edge es Cloudflare, así que se le pregunta a él y se reintenta (#6).
+    info "Esperando a que Cloudflare vea el túnel conectado (máx. ${TUNNEL_HEALTH_TIMEOUT}s)"
+    ts_rc=0; wait_tunnel_healthy || ts_rc=$?
+    case "$ts_rc" in
+        0)
+            if [ "$TUNNEL_HEALTH" = degraded ]; then
+                warn "El túnel conecta y pasa tráfico, pero Cloudflare lo ve 'degraded':"
+                warn "tiene menos conexiones al edge de las esperadas. Suele ser la red."
+            else
+                ok "Cloudflare ve el túnel conectado (healthy)"
+            fi
+            ;;
+        2)
+            warn "No se ha podido consultar el estado del túnel en Cloudflare."
+            note "El servicio está activo y puede estar perfectamente; simplemente no se"
+            note "ha podido confirmar. Abre https://$COOLIFY_FQDN en un par de minutos."
+            ;;
+        *)
+            tunnel_diagnose
+            return 1
+            ;;
+    esac
 }
 run_step tunnel_service "Servicio cloudflared" do_tunnel_service
 
@@ -1446,8 +1637,12 @@ write_summaries() {
         printf '  el comodín ya está enrutado, no hay que tocar DNS por cada app.\n'
         printf '\nCLOUDFLARE TUNNEL\n'
         printf '  Zona .............. %s\n' "$ROOT_DOMAIN"
+        printf '  Túnel ............. %s\n' "${TUNNEL_NAME:-omitido}"
         printf '  Tunnel ID ......... %s\n' "${TUNNEL_ID:-omitido}"
         printf '  CNAME ............. %s y %s\n' "$APP_WILDCARD" "$COOLIFY_FQDN"
+        printf '  El nombre del túnel sale del dominio del panel, no del hostname:\n'
+        printf '  reinstalar este equipo reutiliza este mismo túnel. Nada de lo que\n'
+        printf '  hay en Cloudflare se borra solo, tampoco con --reset.\n'
         printf '\nESTADO DE SERVICIOS\n'
         printf '  docker ............ %s\n' "$(svc_state docker)"
         printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
