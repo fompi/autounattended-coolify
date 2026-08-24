@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators resolution build latecommands
+# Grupos: syntax json validators timezone secrets installer resolution build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y el paso tunnel_service (habla con el edge real de Cloudflare).
@@ -45,7 +45,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators resolution build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer resolution build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -178,6 +178,269 @@ if printf '%s' "$P1" | grep -q '^[A-Za-z0-9]*$'; then ok "contrasena alfanumeric
 else bad "contrasena alfanumerica" "$P1"; fi
 fi
 
+# ---------------------------------------------------------- zona horaria
+if want timezone; then
+group "Zona horaria: sistema antes que geolocalizacion (#12)"
+eval "$(sed -n '/^system_timezone() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^tz_is_placeholder() {/,/^}/p' "$ROOT/setup.sh")"
+
+TZR="$TMP/tzroot"; mkdir -p "$TZR/etc"
+is "sin /etc/timezone ni symlink no inventa nada" "" "$(system_timezone "$TZR")"
+printf 'Europe/Madrid\n' > "$TZR/etc/timezone"
+is "lee /etc/timezone" "Europe/Madrid" "$(system_timezone "$TZR")"
+printf '  Europe/Madrid  \n' > "$TZR/etc/timezone"
+is "recorta espacios y salto de linea" "Europe/Madrid" "$(system_timezone "$TZR")"
+rm -f "$TZR/etc/timezone"
+ln -sf /usr/share/zoneinfo/America/Bogota "$TZR/etc/localtime"
+is "cae al symlink de /etc/localtime" "America/Bogota" "$(system_timezone "$TZR")"
+: > "$TZR/etc/timezone"
+is "/etc/timezone vacio no tapa al symlink" "America/Bogota" "$(system_timezone "$TZR")"
+
+for tz in '' UTC Etc/UTC GMT; do
+    if tz_is_placeholder "$tz"; then ok "tz_is_placeholder('$tz')"
+    else bad "tz_is_placeholder('$tz')" "deberia considerarse vacia"; fi
+done
+for tz in Europe/Madrid America/Bogota Asia/Tokyo; do
+    if tz_is_placeholder "$tz"; then bad "tz_is_placeholder('$tz')" "no es un relleno"
+    else ok "no tz_is_placeholder('$tz')"; fi
+done
+
+# La regla entera: solo se llama a ipapi.co si la zona del sistema no dice
+# nada, no se paso --timezone y no se paso --no-geoip. Se comprueba sobre el
+# texto del script porque la llamada real no se puede hacer en la suite.
+n=$(grep -c 'fetch_stdout "https://ipapi.co' "$ROOT/setup.sh" || true)
+is "una sola llamada a ipapi.co en todo el script" "1" "$n"
+# El aviso tiene que estar ANTES de la llamada, no despues.
+avi=$(grep -n 'se va a consultar https://ipapi.co' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+lla=$(grep -n 'fetch_stdout "https://ipapi.co' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ -n "$avi" ] && [ -n "$lla" ] && [ "$avi" -lt "$lla" ]; then
+    ok "se avisa por pantalla antes de la llamada"
+else
+    bad "se avisa por pantalla antes de la llamada" "aviso en ${avi:-?}, llamada en ${lla:-?}"
+fi
+case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+    *--no-geoip*) ok "--no-geoip aparece en la ayuda" ;;
+    *) bad "--no-geoip aparece en la ayuda" ;;
+esac
+fi
+
+# --------------------------------------------------------------- secretos
+if want secrets; then
+group "Secretos: borrado, resumen partido y orden de #3"
+eval "$(sed -n '/^wipe_file() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^wipe_secrets() {/,/^}/p' "$ROOT/setup.sh")"
+have() { command -v "$1" >/dev/null 2>&1; }
+_ts() { echo '2026-01-01 00:00:00'; }
+svc_state() { echo activo; }
+warn() { :; }
+note() { :; }
+
+SEC="$TMP/sec"; mkdir -p "$SEC"
+
+# wipe_file: borra lo que hay y no se queja de lo que no.
+printf 'secreto\n' > "$SEC/victima"
+wipe_file "$SEC/victima"
+if [ -e "$SEC/victima" ]; then bad "wipe_file borra el fichero"; else ok "wipe_file borra el fichero"; fi
+st=0; wipe_file "$SEC/no-existe" || st=$?
+is "wipe_file devuelve 0 si no existe" "0" "$st"
+st=0; wipe_file "" || st=$?
+is "wipe_file devuelve 0 con argumento vacio" "0" "$st"
+
+# El resumen no puede llevar contrasenas; el de credenciales, si. Las
+# variables las consume write_summaries, cargada con eval: el analizador no
+# puede verlo, de ahi la directiva.
+# shellcheck disable=SC2034
+fake_config() {
+    NEW_HOSTNAME='maquina'
+    TIMEZONE='Europe/Madrid'
+    TIMEZONE_SOURCE='sistema'
+    ADMIN_USER='admin'
+    ADMIN_PASSWORD='CLAVEADMIN123'
+    SSH_KEY=''
+    COOLIFY_FQDN='coolify.fompi.net'
+    COOLIFY_EMAIL='a@b.com'
+    COOLIFY_PASSWORD='CLAVECOOLIFY456'
+    COOLIFY_REGISTERED=1
+    SKIP_COOLIFY=''
+    APP_SUBDOMAIN='app'
+    ROOT_DOMAIN='fompi.net'
+    APP_WILDCARD='*.app.fompi.net'
+    TUNNEL_ID='tid'
+    INSTALLER_USER='installer'
+    INSTALLER_STATE='bloqueada, fuera de sudo y con shell /usr/sbin/nologin'
+    LOG_FILE="$SEC/log"
+    IS_ROOT=''
+    KEEP_SECRETS=''
+    SETUP_ENV_FILE="$SEC/etc-env"
+    SUMMARY_FILE="$SEC/resumen.txt"
+    CREDS_FILE="$SEC/credenciales.txt"
+    CONFIG_FILE="$SEC/config.env"
+    TUNNEL_FILE="$SEC/tunnel.env"
+}
+fake_config
+
+write_summaries
+if grep -q 'CLAVEADMIN123\|CLAVECOOLIFY456' "$SUMMARY_FILE"; then
+    bad "el resumen no lleva contrasenas" "$(grep -n 'CLAVE' "$SUMMARY_FILE" | head -2)"
+else
+    ok "el resumen no lleva contrasenas"
+fi
+if grep -q 'CLAVEADMIN123' "$CREDS_FILE" && grep -q 'CLAVECOOLIFY456' "$CREDS_FILE"; then
+    ok "las credenciales van a su propio fichero"
+else
+    bad "las credenciales van a su propio fichero"
+fi
+case "$(cat "$SUMMARY_FILE")" in
+    *"$CREDS_FILE"*) ok "el resumen dice donde estan las credenciales" ;;
+    *) bad "el resumen dice donde estan las credenciales" ;;
+esac
+case "$(cat "$SUMMARY_FILE")" in
+    *'Cuenta de rescate'*'fuera de sudo'*) ok "el resumen dice como quedo la cuenta de rescate" ;;
+    *) bad "el resumen dice como quedo la cuenta de rescate" ;;
+esac
+if have stat; then
+    for f in "$SUMMARY_FILE" "$CREDS_FILE"; do
+        m=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null || echo '?')
+        is "$(basename "$f") queda en 0600" "600" "$m"
+    done
+fi
+
+# wipe_secrets: borra los tres, o los conserva si se pide.
+printf "CF_TOKEN='x'\n" > "$CONFIG_FILE"
+printf "TUNNEL_TOKEN='y'\n" > "$TUNNEL_FILE"
+KEEP_SECRETS=1
+wipe_secrets
+if [ -f "$CONFIG_FILE" ] && [ -f "$TUNNEL_FILE" ]; then
+    ok "--keep-secrets conserva los ficheros"
+else
+    bad "--keep-secrets conserva los ficheros"
+fi
+# shellcheck disable=SC2034
+KEEP_SECRETS=''
+wipe_secrets
+if [ -e "$CONFIG_FILE" ] || [ -e "$TUNNEL_FILE" ]; then
+    bad "sin --keep-secrets se borran config.env y tunnel.env"
+else
+    ok "sin --keep-secrets se borran config.env y tunnel.env"
+fi
+# Sin ser root no se toca /etc/coolify-setup.env: no es nuestro.
+printf 'CF_API_TOKEN=x\n' > "$SETUP_ENV_FILE"
+IS_ROOT=''; wipe_secrets
+if [ -f "$SETUP_ENV_FILE" ]; then ok "sin root no se toca /etc/coolify-setup.env"
+else bad "sin root no se toca /etc/coolify-setup.env"; fi
+# shellcheck disable=SC2034
+IS_ROOT=1
+wipe_secrets
+if [ -e "$SETUP_ENV_FILE" ]; then bad "como root se borra el env con el token"
+else ok "como root se borra el env con el token"; fi
+
+# El orden del camino de exito es lo critico de #3: si se borra el token antes
+# de marcar el completado y algo falla en medio, el servicio vuelve a arrancar
+# y pide el token en bucle.
+l_sum=$(grep -n '^write_summaries$' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_mark=$(grep -n '^touch "\$DONE_MARKER"$' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_wipe=$(grep -n '^wipe_secrets$' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ -n "$l_sum" ] && [ -n "$l_mark" ] && [ -n "$l_wipe" ] \
+   && [ "$l_sum" -lt "$l_mark" ] && [ "$l_mark" -lt "$l_wipe" ]; then
+    ok "orden resumen -> marca de completado -> borrado"
+else
+    bad "orden resumen -> marca de completado -> borrado" \
+        "resumen=${l_sum:-?} marca=${l_mark:-?} borrado=${l_wipe:-?}"
+fi
+for f in --keep-secrets --summary-no-secrets; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
+# -------------------------------------------------------------- installer
+if want installer; then
+group "Cuenta de rescate 'installer' (#9)"
+eval "$(sed -n '/^groups_have_admin() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^shadow_hash_is_real() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^shadow_field() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^nologin_shell() {/,/^}/p' "$ROOT/setup.sh")"
+
+chk() { # chk descripcion fn arg esperado(0|1)
+    if "$2" "$3"; then got=0; else got=1; fi
+    if [ "$got" = "$4" ]; then ok "$1"; else bad "$1" "esperaba rc=$4"; fi
+}
+chk "grupo sudo manda"            groups_have_admin "usuario docker sudo" 0
+chk "grupo wheel manda"           groups_have_admin "wheel" 0
+chk "grupo admin manda"           groups_have_admin "staff admin" 0
+chk "sin grupo de mando"          groups_have_admin "usuario docker users" 1
+chk "lista vacia no manda"        groups_have_admin "" 1
+# Regresion: 'sudoers' no es 'sudo'.
+chk "sudoers no cuela por sudo"   groups_have_admin "sudoers pseudo" 1
+
+chk "hash sha512 es utilizable"   shadow_hash_is_real '$6$sal$hash' 0
+chk "hash yescrypt es utilizable" shadow_hash_is_real '$y$j9T$sal$hash' 0
+chk "vacio no es credencial"      shadow_hash_is_real '' 1
+chk "cuenta bloqueada con !"      shadow_hash_is_real '!' 1
+chk "bloqueada con !!"            shadow_hash_is_real '!!' 1
+chk "bloqueada conservando hash"  shadow_hash_is_real '!$6$sal$hash' 1
+chk "deshabilitada con *"         shadow_hash_is_real '*' 1
+chk "x de passwd no es hash"      shadow_hash_is_real 'x' 1
+
+SH="$TMP/shadow"
+cat > "$SH" <<'SHADOW'
+root:!:19000:0:99999:7:::
+admin:$6$sal$hash:19000:0:99999:7:::
+installer:!:19000:0:99999:7:::
+SHADOW
+is "shadow_field lee el hash"        '$6$sal$hash' "$(shadow_field "$SH" admin)"
+is "shadow_field ve la bloqueada"    '!'           "$(shadow_field "$SH" installer)"
+is "shadow_field con usuario ausente" ''           "$(shadow_field "$SH" nadie)"
+is "shadow_field sin fichero"        ''            "$(shadow_field "$TMP/no-hay" admin)"
+
+NS=$(nologin_shell)
+case "$NS" in
+    /*nologin|/*false) ok "nologin_shell devuelve una shell que no deja entrar" ;;
+    *) bad "nologin_shell devuelve una shell que no deja entrar" "$NS" ;;
+esac
+
+# El paso tiene que ser el ultimo: mientras algo pueda fallar, 'installer' es
+# la unica via de entrada garantizada.
+last=$(grep -n '^run_step ' "$ROOT/setup.sh" | tail -n1)
+case "$last" in
+    *retire_installer*) ok "retire_installer es el ultimo run_step" ;;
+    *) bad "retire_installer es el ultimo run_step" "el ultimo es: $last" ;;
+esac
+l_tun=$(grep -n '^run_step tunnel_service' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_ret=$(grep -n '^run_step retire_installer' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ -n "$l_tun" ] && [ -n "$l_ret" ] && [ "$l_tun" -lt "$l_ret" ]; then
+    ok "va despues de tunnel_service"
+else
+    bad "va despues de tunnel_service" "tunnel=${l_tun:-?} retire=${l_ret:-?}"
+fi
+
+# Y NO puede abortar la instalacion: si aborta, el usuario se queda sin el
+# fichero de credenciales, que es mucho peor que una cuenta de rescate viva.
+sed -n '/^do_retire_installer() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/retire.sh"
+if [ -s "$TMP/retire.sh" ]; then ok "do_retire_installer se puede extraer"
+else bad "do_retire_installer se puede extraer"; fi
+n=$(grep -cE '(^|[^_[:alnum:]])die ' "$TMP/retire.sh" || true)
+is "no llama a die" "0" "$n"
+n=$(grep -cE '^[[:space:]]*return [1-9]' "$TMP/retire.sh" || true)
+is "todos los return son 0" "0" "$n"
+# La shell nologin es imprescindible: 'usermod -L' no impide entrar por clave.
+if grep -q 'usermod -s' "$TMP/retire.sh"; then
+    ok "ademas de bloquear, cambia la shell a nologin"
+else
+    bad "ademas de bloquear, cambia la shell a nologin" "usermod -L no cierra el SSH por clave"
+fi
+
+for f in --keep-rescue --purge-installer --installer-user; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
 # --------------------------------------------------------------- resolucion
 if want resolution; then
 group "Resolucion de configuracion (contra la API simulada)"
@@ -207,7 +470,7 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
     setup() { # setup ARGS... -> salida combinada
         env CF_API_BASE="http://127.0.0.1:$PORT" \
             XDG_STATE_HOME="$(mktemp -d "$TMP/state.XXXXXX")" \
-            HOME="$TMP" NO_COLOR=1 \
+            HOME="$TMP" NO_COLOR=1 NO_GEOIP=1 \
             sh "$ROOT/setup.sh" "$@" 2>&1 || true
     }
 
@@ -275,6 +538,31 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
         *"*.nuevo.fompi.net"*) ok "los argumentos pisan lo guardado" ;;
         *) bad "los argumentos pisan lo guardado" "$(printf '%s' "$out" | grep Apps || true)" ;;
     esac
+
+    # #3: si el asistente falla a mitad, los secretos TIENEN que seguir ahi
+    # para que el reintento no vuelva a pedir el token. Sin --dry-run y sin
+    # root, el paso 'hostname' falla: es un fallo a mitad de verdad.
+    F="$TMP/fallo"
+    st=0; env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$F" \
+        HOME="$TMP" NO_COLOR=1 NO_GEOIP=1 sh "$ROOT/setup.sh" \
+        --cf-token=GOODTOKEN --domain=fompi.net --skip-docker --skip-coolify \
+        --skip-tunnel --non-interactive >/dev/null 2>&1 || st=$?
+    is "un fallo a mitad sale con rc=1" "1" "$st"
+    if [ -f "$F/coolify-setup/config.env" ]; then
+        ok "tras un fallo a mitad config.env sigue ahi"
+    else
+        bad "tras un fallo a mitad config.env sigue ahi" "el reintento pediria el token otra vez"
+    fi
+    if grep -q "CF_TOKEN='GOODTOKEN'" "$F/coolify-setup/config.env" 2>/dev/null; then
+        ok "y conserva el token para el reintento"
+    else
+        bad "y conserva el token para el reintento"
+    fi
+    if [ -e "$F/coolify-setup/completed" ]; then
+        bad "tras un fallo a mitad NO hay marca de completado"
+    else
+        ok "tras un fallo a mitad NO hay marca de completado"
+    fi
 
     kill "$MOCK_PID" 2>/dev/null; MOCK_PID=''
 fi

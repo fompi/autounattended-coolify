@@ -28,11 +28,16 @@ if [ "$(id -u)" = "0" ]; then
     STATE_DIR=/var/lib/coolify-setup
     LOG_FILE=/var/log/coolify-setup.log
     SUMMARY_FILE=/root/instalacion-resumen.txt
+    CREDS_FILE=/root/instalacion-credenciales.txt
 else
     STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/coolify-setup"
     LOG_FILE="$STATE_DIR/setup.log"
     SUMMARY_FILE="$HOME/instalacion-resumen.txt"
+    CREDS_FILE="$HOME/instalacion-credenciales.txt"
 fi
+# Lo escribe el 'late-commands' del autoinstall y es de donde el servicio saca
+# el token al reintentar. Se borra solo al completar con exito.
+SETUP_ENV_FILE=/etc/coolify-setup.env
 WORK_DIR="$STATE_DIR/work"      # dependencias descargadas, no instaladas
 DONE_MARKER="$STATE_DIR/completed"
 
@@ -77,6 +82,18 @@ die() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Borra un fichero sobrescribiéndolo antes si el sistema trae shred. Aviso:
+# sobre SSD, COW o sistemas con journal, sobrescribir no garantiza nada — el
+# bloque original puede seguir vivo. Es una mejora, no una promesa.
+wipe_file() {
+    [ -n "${1:-}" ] && [ -e "$1" ] || return 0
+    if have shred && shred -u "$1" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$1"
+    return 0
+}
+
 # ============================================================================
 # Argumentos
 # ============================================================================
@@ -106,9 +123,15 @@ SISTEMA (todo opcional, todo derivado o generado si se omite)
   --admin-password=V     Por defecto: se genera. Acepta @fichero / @-.
   --ssh-key=VALOR        Clave pública SSH. Acepta @fichero. Si se indica, se
                          deshabilita la autenticación por contraseña.
-  --timezone=TZ          Por defecto: se deduce por geolocalización de la IP.
+  --timezone=TZ          Por defecto: la del sistema; si el sistema está en UTC,
+                         se deduce por geolocalización de la IP (ver --no-geoip).
+  --no-geoip             No consultar nunca ipapi.co para deducir la zona
+                         horaria: si el sistema no la tiene, se queda en UTC.
+                         Equivale a la variable de entorno NO_GEOIP=1.
   --wifi-ssid=SSID       Solo se usa (y se pregunta) si no hay red al arrancar.
   --wifi-password=V      Acepta @fichero / @-.
+  --installer-user=NOM   Cuenta de rescate creada por el autoinstall. Por
+                         defecto: installer.
 
 COOLIFY
   --coolify-email=MAIL   Por defecto: se deduce de la cuenta CF, o admin@dominio
@@ -121,6 +144,14 @@ CONTROL
   --skip-coolify         No instalar Coolify.
   --skip-tunnel          No crear el túnel de Cloudflare.
   --reset                Olvidar el estado previo y empezar de cero.
+  --keep-secrets         No borrar al terminar los ficheros con el token de
+                         Cloudflare, el del túnel y la configuración resuelta.
+  --summary-no-secrets   No imprimir contraseñas por pantalla al terminar; se
+                         quedan solo en el fichero de credenciales.
+  --keep-rescue          Dejar la cuenta de rescate tal cual, con su sudo y su
+                         contraseña si se puso --rescue-password al construir.
+  --purge-installer      Borrar la cuenta de rescate y su home (userdel -r) en
+                         vez de bloquearla.
   --dry-run              Mostrar la configuración resuelta y salir.
   -h, --help             Esta ayuda.
 
@@ -142,10 +173,14 @@ argval() {
 CF_TOKEN="${CF_API_TOKEN:-}"
 ROOT_DOMAIN=''; APP_SUBDOMAIN=''; COOLIFY_SUBDOMAIN=''
 NEW_HOSTNAME=''; ADMIN_USER=''; ADMIN_PASSWORD=''; SSH_KEY=''; TIMEZONE=''
+TIMEZONE_SOURCE=''
 WIFI_SSID=''; WIFI_PASSWORD=''
 COOLIFY_EMAIL=''; COOLIFY_PASSWORD=''
 ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
+NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
+KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
+INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 
 # Argumentos horneados en el USB al construirlo (via EnvironmentFile del
 # servicio systemd). Van delante para que lo que se pase a mano los pueda pisar.
@@ -173,8 +208,8 @@ while [ $# -gt 0 ]; do
         --admin-password)       shift; ADMIN_PASSWORD=$(argval "$1") ;;
         --ssh-key=*)            SSH_KEY=$(argval "${1#*=}") ;;
         --ssh-key)              shift; SSH_KEY=$(argval "$1") ;;
-        --timezone=*)           TIMEZONE=${1#*=} ;;
-        --timezone)             shift; TIMEZONE=$1 ;;
+        --timezone=*)           TIMEZONE=${1#*=}; TIMEZONE_SOURCE=indicada ;;
+        --timezone)             shift; TIMEZONE=$1; TIMEZONE_SOURCE=indicada ;;
         --wifi-ssid=*)          WIFI_SSID=${1#*=} ;;
         --wifi-ssid)            shift; WIFI_SSID=$1 ;;
         --wifi-password=*)      WIFI_PASSWORD=$(argval "${1#*=}") ;;
@@ -185,10 +220,17 @@ while [ $# -gt 0 ]; do
         --coolify-password)     shift; COOLIFY_PASSWORD=$(argval "$1") ;;
         -y|--yes)               ASSUME_YES=1 ;;
         --non-interactive)      NON_INTERACTIVE=1; ASSUME_YES=1 ;;
+        --no-geoip)             NO_GEOIP=1 ;;
         --skip-docker)          SKIP_DOCKER=1 ;;
         --skip-coolify)         SKIP_COOLIFY=1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
         --reset)                DO_RESET=1 ;;
+        --installer-user=*)     INSTALLER_USER=${1#*=} ;;
+        --installer-user)       shift; INSTALLER_USER=$1 ;;
+        --keep-rescue)          KEEP_RESCUE=1 ;;
+        --purge-installer)      PURGE_INSTALLER=1 ;;
+        --keep-secrets)         KEEP_SECRETS=1 ;;
+        --summary-no-secrets)   SUMMARY_NO_SECRETS=1 ;;
         --dry-run)              DRY_RUN=1 ;;
         -h|--help)              usage; exit 0 ;;
         *) usage >&2; die "Opción desconocida: $1" ;;
@@ -560,6 +602,66 @@ valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
 
+# Zona horaria que ya tiene el sistema, por stdout; cadena vacía si no hay.
+# El parámetro RAIZ solo existe para poder probar la función contra un /etc
+# simulado: en producción se llama sin argumentos. Eso es justo lo que detecta
+# SC2120, así que se silencia aquí: shellcheck 0.9 (el de Ubuntu, y por tanto
+# el de CI) lo marca y 0.11 ya no, de modo que sin esto el lint depende de qué
+# versión tenga instalada quien lo ejecute.
+# shellcheck disable=SC2120
+system_timezone() {
+    _tzroot=${1:-}
+    _tz=''
+    if [ -r "$_tzroot/etc/timezone" ]; then
+        _tz=$(tr -d ' \n\r' < "$_tzroot/etc/timezone" 2>/dev/null || true)
+    fi
+    if [ -z "$_tz" ] && [ -L "$_tzroot/etc/localtime" ]; then
+        _tz=$(readlink "$_tzroot/etc/localtime" 2>/dev/null | sed 's#.*/zoneinfo/##')
+    fi
+    printf '%s' "$_tz"
+}
+
+# Cierto si la zona horaria no dice nada del sitio donde está el equipo. UTC no
+# es un dato: es lo que queda cuando nadie ha elegido nada.
+tz_is_placeholder() {
+    case "${1:-}" in
+        ''|UTC|Etc/UTC|GMT|Etc/GMT|Universal|Etc/Universal) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Cierto si alguno de los grupos de la lista da mando en la máquina.
+groups_have_admin() {
+    for _g in ${1:-}; do
+        case "$_g" in sudo|wheel|admin) return 0 ;; esac
+    done
+    return 1
+}
+
+# El campo de contraseña de /etc/shadow. Vacío es "sin contraseña"; '!' y '*'
+# son cuenta bloqueada o deshabilitada. Cualquier otra cosa es un hash con el
+# que alguien puede entrar de verdad.
+shadow_hash_is_real() {
+    case "${1:-}" in
+        ''|'!'*|'*'*|x) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# shadow_field FICHERO USUARIO -> campo de contraseña por stdout.
+shadow_field() {
+    [ -r "$1" ] || return 0
+    awk -F: -v u="$2" '$1==u {print $2; exit}' "$1"
+}
+
+# Primera shell que impida iniciar sesión, por stdout.
+nologin_shell() {
+    for _s in /usr/sbin/nologin /sbin/nologin /usr/bin/false /bin/false; do
+        [ -x "$_s" ] && { printf '%s' "$_s"; return 0; }
+    done
+    printf '/bin/false'
+}
+
 gen_password() {
     if [ -r /dev/urandom ]; then
         LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | dd bs=1 count=24 2>/dev/null
@@ -609,8 +711,9 @@ if [ -f "$CONFIG_FILE" ]; then
     _logfile "Recuperando configuración previa de $CONFIG_FILE"
     eval "$(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=/SAVED_\1=/p' "$CONFIG_FILE")"
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
-              NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE \
-              WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD; do
+              NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
+              WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD \
+              INSTALLER_USER; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
     done
@@ -618,6 +721,7 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 : "${APP_SUBDOMAIN:=app}"
+: "${INSTALLER_USER:=installer}"
 : "${COOLIFY_SUBDOMAIN:=coolify}"
 
 info "Resolviendo configuración"
@@ -759,7 +863,7 @@ id "$ADMIN_USER" >/dev/null 2>&1 && ADMIN_USER_EXISTED=1
 # existe no se le toca la credencial.
 if [ -z "$ADMIN_PASSWORD" ] && [ -z "$ADMIN_USER_EXISTED" ] && [ -z "$SSH_KEY" ]; then
     ADMIN_PASSWORD=$(gen_password)
-    note "Contraseña de $ADMIN_USER generada (se mostrará en el resumen)"
+    note "Contraseña de $ADMIN_USER generada (irá al fichero de credenciales)"
 fi
 
 # Clave SSH ya presente en el sistema: reutilizarla en vez de pedirla.
@@ -770,22 +874,40 @@ if [ -z "$SSH_KEY" ] && [ -n "$ADMIN_USER_EXISTED" ]; then
     fi
 fi
 
-# --- Zona horaria: geolocalización -> sistema -> UTC ---------------------
+# --- Zona horaria: sistema -> geolocalización -> UTC ---------------------
+# El orden importa. La zona del sistema ya suele estar bien (el instalador de
+# Ubuntu la fija) y no le cuenta nada a nadie; la geolocalización revela a un
+# tercero la IP pública y el momento de la instalación, así que es el último
+# recurso, se anuncia antes de hacerla y se puede desactivar.
 if [ -z "$TIMEZONE" ]; then
-    TIMEZONE=$(fetch_stdout "https://ipapi.co/timezone" 2>/dev/null | tr -d ' \n\r' || true)
-    if [ -n "$TIMEZONE" ] && [ -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
-        note "Zona horaria deducida por geolocalización: $TIMEZONE"
-    else
-        TIMEZONE=''
-        if [ -r /etc/timezone ]; then
-            TIMEZONE=$(cat /etc/timezone 2>/dev/null | tr -d ' \n\r')
-        elif [ -L /etc/localtime ]; then
-            TIMEZONE=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
-        fi
-        : "${TIMEZONE:=UTC}"
+    TIMEZONE=$(system_timezone)
+    if ! tz_is_placeholder "$TIMEZONE"; then
+        TIMEZONE_SOURCE=sistema
         note "Zona horaria del sistema: $TIMEZONE"
+    elif [ -n "$NO_GEOIP" ]; then
+        TIMEZONE_SOURCE=utc
+        : "${TIMEZONE:=UTC}"
+        note "Zona horaria: $TIMEZONE (geolocalización desactivada por --no-geoip/NO_GEOIP)."
+        note "Si no es la que quieres, pásala con --timezone=Area/Ciudad."
+    else
+        warn "El sistema no tiene zona horaria propia; está en ${TIMEZONE:-UTC}."
+        note "Para deducirla se va a consultar https://ipapi.co/timezone, que verá la"
+        note "IP pública de este equipo y el momento de la instalación."
+        note "Para evitarlo: --timezone=Area/Ciudad, o --no-geoip para quedarse en UTC."
+        geo_tz=$(fetch_stdout "https://ipapi.co/timezone" 2>/dev/null | tr -d ' \n\r' || true)
+        if [ -n "$geo_tz" ] && [ -e "/usr/share/zoneinfo/$geo_tz" ]; then
+            TIMEZONE=$geo_tz
+            TIMEZONE_SOURCE=geoip
+            note "Zona horaria deducida por geolocalización: $TIMEZONE"
+        else
+            TIMEZONE_SOURCE=utc
+            : "${TIMEZONE:=UTC}"
+            note "La geolocalización no devolvió una zona válida; se queda en $TIMEZONE."
+        fi
     fi
 fi
+: "${TIMEZONE:=UTC}"
+: "${TIMEZONE_SOURCE:=indicada}"
 
 # --- Datos de Coolify: derivados y generados -----------------------------
 if [ -z "$COOLIFY_EMAIL" ]; then
@@ -801,9 +923,21 @@ if [ -z "$COOLIFY_EMAIL" ]; then
 fi
 valid_email "$COOLIFY_EMAIL" || die "Email de Coolify no válido: $COOLIFY_EMAIL"
 
+# El nombre acaba en userdel/usermod: se valida antes de acercarlo a nada.
+printf '%s' "$INSTALLER_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_.-]*$' \
+    || die "Nombre de cuenta de rescate no válido: $INSTALLER_USER"
+
+if [ -n "$KEEP_RESCUE" ]; then
+    INSTALLER_PLAN="se conserva tal cual (--keep-rescue)"
+elif [ -n "$PURGE_INSTALLER" ]; then
+    INSTALLER_PLAN="se borrará con su home (--purge-installer)"
+else
+    INSTALLER_PLAN="se bloqueará y saldrá de sudo al terminar"
+fi
+
 if [ -z "$COOLIFY_PASSWORD" ]; then
     COOLIFY_PASSWORD=$(gen_password)
-    note "Contraseña de Coolify generada (se mostrará en el resumen)"
+    note "Contraseña de Coolify generada (irá al fichero de credenciales)"
 fi
 
 APP_WILDCARD="*.$APP_SUBDOMAIN.$ROOT_DOMAIN"
@@ -824,10 +958,12 @@ ADMIN_USER='$ADMIN_USER'
 ADMIN_PASSWORD='$(printf '%s' "$ADMIN_PASSWORD" | sed "s/'/'\\\\''/g")'
 SSH_KEY='$(printf '%s' "$SSH_KEY" | sed "s/'/'\\\\''/g")'
 TIMEZONE='$TIMEZONE'
+TIMEZONE_SOURCE='$TIMEZONE_SOURCE'
 WIFI_SSID='$(printf '%s' "$WIFI_SSID" | sed "s/'/'\\\\''/g")'
 WIFI_PASSWORD='$(printf '%s' "$WIFI_PASSWORD" | sed "s/'/'\\\\''/g")'
 COOLIFY_EMAIL='$COOLIFY_EMAIL'
 COOLIFY_PASSWORD='$(printf '%s' "$COOLIFY_PASSWORD" | sed "s/'/'\\\\''/g")'
+INSTALLER_USER='$INSTALLER_USER'
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -838,15 +974,17 @@ CONFIG_SUMMARY="Configuración resuelta:
 
   Hostname .......... $NEW_HOSTNAME
   Usuario admin ..... $ADMIN_USER $([ -n "$ADMIN_USER_EXISTED" ] && echo '(ya existe, no se toca)' || echo '(se creará)')
-  Zona horaria ...... $TIMEZONE
+  Zona horaria ...... $TIMEZONE (origen: $TIMEZONE_SOURCE)
   Red ............... $([ -n "$WIFI_SSID" ] && echo "WiFi '$WIFI_SSID'" || echo 'Ethernet/DHCP')
+  Cuenta de rescate . $INSTALLER_USER: $INSTALLER_PLAN
 
   Dominio ........... $ROOT_DOMAIN
   Apps .............. https://$APP_WILDCARD  ->  localhost:80
   Panel Coolify ..... https://$COOLIFY_FQDN  ->  localhost:8000
   Email Coolify ..... $COOLIFY_EMAIL
 
-  Contraseñas generadas automáticamente; se mostrarán al terminar."
+  Contraseñas generadas automáticamente; al terminar quedan en
+  $CREDS_FILE (modo 0600), no en el resumen."
 
 printf '\n%s\n\n' "$CONFIG_SUMMARY"
 
@@ -1164,6 +1302,104 @@ do_tunnel_service() {
 }
 run_step tunnel_service "Servicio cloudflared" do_tunnel_service
 
+# --- Cuenta de rescate ----------------------------------------------------
+# Va la última a propósito: mientras algo pueda fallar, la cuenta 'installer'
+# es la única vía de entrada garantizada, que es justo para lo que existe.
+#
+# Este paso NUNCA aborta la instalación. Si no puede retirar la cuenta, lo dice
+# y sigue: quedarse sin el fichero de credenciales por culpa de esto sería peor
+# que dejar viva una cuenta de rescate, y el resumen dice siempre cómo quedó.
+INSTALLER_STATE='sin tocar (paso ya completado en un intento anterior)'
+
+# Cierto si con este usuario se puede entrar y mandar. Sin esto no se retira
+# nada: dejaríamos el equipo sin ninguna forma de acceso.
+admin_is_usable() {
+    _au=$1
+    id "$_au" >/dev/null 2>&1 || { warn "El usuario '$_au' no existe."; return 1; }
+    if ! groups_have_admin "$(id -nG "$_au" 2>/dev/null || true)"; then
+        warn "El usuario '$_au' no está en sudo/wheel/admin."
+        return 1
+    fi
+    if shadow_hash_is_real "$(shadow_field /etc/shadow "$_au")"; then
+        return 0
+    fi
+    _ahome=$(getent passwd "$_au" 2>/dev/null | cut -d: -f6 || true)
+    if [ -n "$_ahome" ] && [ -s "$_ahome/.ssh/authorized_keys" ]; then
+        return 0
+    fi
+    warn "El usuario '$_au' no tiene contraseña utilizable ni claves SSH autorizadas."
+    return 1
+}
+
+do_retire_installer() {
+    if [ -n "$KEEP_RESCUE" ]; then
+        INSTALLER_STATE="CONSERVADA por --keep-rescue: sigue con sudo"
+        warn "La cuenta de rescate '$INSTALLER_USER' se conserva tal cual."
+        return 0
+    fi
+    if [ "$OS_N" != linux ]; then
+        INSTALLER_STATE="sin tocar (gestión de usuarios solo automatizada en Linux)"
+        return 0
+    fi
+    if ! id "$INSTALLER_USER" >/dev/null 2>&1; then
+        INSTALLER_STATE="no existe en este equipo"
+        note "No hay ninguna cuenta '$INSTALLER_USER' que retirar."
+        return 0
+    fi
+    if [ "$INSTALLER_USER" = "$ADMIN_USER" ]; then
+        INSTALLER_STATE="CONSERVADA: es también la cuenta de administración"
+        warn "'$INSTALLER_USER' es el usuario administrador; no se retira."
+        return 0
+    fi
+    if [ -z "$IS_ROOT" ]; then
+        INSTALLER_STATE="CONSERVADA: hacía falta root para retirarla"
+        warn "Sin privilegios de root no se puede retirar '$INSTALLER_USER'."
+        return 0
+    fi
+    if ! admin_is_usable "$ADMIN_USER"; then
+        INSTALLER_STATE="CONSERVADA: no se pudo verificar que '$ADMIN_USER' sirva para entrar"
+        warn "La cuenta de rescate '$INSTALLER_USER' sigue viva y con sudo."
+        warn "Comprueba que entras con '$ADMIN_USER' y retírala a mano:"
+        warn "  usermod -L $INSTALLER_USER && usermod -s $(nologin_shell) $INSTALLER_USER"
+        return 0
+    fi
+
+    if [ -n "$PURGE_INSTALLER" ]; then
+        if userdel -r "$INSTALLER_USER" >/dev/null 2>&1; then
+            INSTALLER_STATE="borrada con su home (--purge-installer)"
+            ok "Cuenta de rescate '$INSTALLER_USER' borrada"
+            return 0
+        fi
+        warn "No se pudo borrar '$INSTALLER_USER'; se intenta bloquearla."
+    fi
+
+    _rfail=''
+    usermod -L "$INSTALLER_USER" >/dev/null 2>&1 || _rfail=1
+    for _g in sudo wheel admin; do
+        getent group "$_g" >/dev/null 2>&1 || continue
+        if have gpasswd; then
+            gpasswd -d "$INSTALLER_USER" "$_g" >/dev/null 2>&1 || true
+        elif have deluser; then
+            deluser "$INSTALLER_USER" "$_g" >/dev/null 2>&1 || true
+        fi
+    done
+    groups_have_admin "$(id -nG "$INSTALLER_USER" 2>/dev/null || true)" && _rfail=1
+    # 'usermod -L' solo tacha el hash: no impide entrar con clave SSH, y la
+    # cuenta la crea el autoinstall con 'allow-pw: true' y ssh abierto. La
+    # shell que no deja iniciar sesión es lo que cierra la puerta de verdad.
+    _nsh=$(nologin_shell)
+    usermod -s "$_nsh" "$INSTALLER_USER" >/dev/null 2>&1 || _rfail=1
+    if [ -n "$_rfail" ]; then
+        INSTALLER_STATE="RETIRADA A MEDIAS: revísala a mano"
+        warn "No se pudo retirar del todo '$INSTALLER_USER'. Revísala a mano."
+        return 0
+    fi
+    INSTALLER_STATE="bloqueada, fuera de sudo y con shell $_nsh"
+    ok "Cuenta de rescate '$INSTALLER_USER' retirada"
+    return 0
+}
+run_step retire_installer "Retirada de la cuenta de rescate '$INSTALLER_USER'" do_retire_installer
+
 # ============================================================================
 # FASE 3 — Resumen
 # ============================================================================
@@ -1173,49 +1409,109 @@ svc_state() {
     else echo 'n/d'; fi
 }
 
-{
-    printf '=== Instalación completada — %s ===\n\n' "$(_ts)"
-    printf 'SISTEMA\n'
-    printf '  Hostname .......... %s\n' "$NEW_HOSTNAME"
-    printf '  Zona horaria ...... %s\n' "$TIMEZONE"
-    printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
-    if [ -n "$ADMIN_PASSWORD" ]; then
-        printf '  Contraseña ........ %s\n' "$ADMIN_PASSWORD"
-    elif [ -n "$SSH_KEY" ]; then
-        printf '  Acceso ............ solo clave SSH (contraseña deshabilitada)\n'
-    else
-        printf '  Contraseña ........ sin cambios (el usuario ya existía)\n'
-    fi
-    printf '\nCOOLIFY\n'
-    printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
-    printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
-    printf '  Contraseña ........ %s\n' "$COOLIFY_PASSWORD"
-    if [ -n "$COOLIFY_REGISTERED" ]; then
-        printf '  Estado ............ usuario registrado, listo para entrar\n'
-    elif [ -z "$SKIP_COOLIFY" ]; then
-        printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
-        printf '                      el email y contraseña de arriba (el primer\n'
-        printf '                      usuario registrado es el propietario).\n'
-    fi
-    printf '\nAPPS\n'
-    printf '  Patrón de dominio . https://<lo-que-sea>.%s.%s\n' "$APP_SUBDOMAIN" "$ROOT_DOMAIN"
-    printf '  Al crear una app en Coolify, ponle un dominio con ese patrón:\n'
-    printf '  el comodín ya está enrutado, no hay que tocar DNS por cada app.\n'
-    printf '\nCLOUDFLARE TUNNEL\n'
-    printf '  Zona .............. %s\n' "$ROOT_DOMAIN"
-    printf '  Tunnel ID ......... %s\n' "${TUNNEL_ID:-omitido}"
-    printf '  CNAME ............. %s y %s\n' "$APP_WILDCARD" "$COOLIFY_FQDN"
-    printf '\nESTADO DE SERVICIOS\n'
-    printf '  docker ............ %s\n' "$(svc_state docker)"
-    printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
-    printf '\n  Log completo ...... %s\n' "$LOG_FILE"
-} > "$SUMMARY_FILE"
-chmod 600 "$SUMMARY_FILE"
+# El resumen se parte en dos a propósito. Uno se puede enseñar, pegar en un
+# ticket o dejar en pantalla; el otro tiene contraseñas en claro y hay que
+# tratarlo como lo que es.
+# Se aísla en una función para poder probarla: la suite la carga con eval y
+# comprueba que el resumen no lleva contraseñas y el de credenciales sí.
+write_summaries() {
+    {
+        printf '=== Instalación completada — %s ===\n\n' "$(_ts)"
+        printf 'SISTEMA\n'
+        printf '  Hostname .......... %s\n' "$NEW_HOSTNAME"
+        printf '  Zona horaria ...... %s (origen: %s)\n' "$TIMEZONE" "$TIMEZONE_SOURCE"
+        printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
+        printf '  Cuenta de rescate . %s: %s\n' "$INSTALLER_USER" "$INSTALLER_STATE"
+        if [ -n "$ADMIN_PASSWORD" ]; then
+            printf '  Acceso ............ contraseña generada (en %s)\n' "$CREDS_FILE"
+        elif [ -n "$SSH_KEY" ]; then
+            printf '  Acceso ............ solo clave SSH (contraseña deshabilitada)\n'
+        else
+            printf '  Acceso ............ sin cambios (el usuario ya existía)\n'
+        fi
+        printf '\nCOOLIFY\n'
+        printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
+        printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
+        printf '  Contraseña ........ en %s\n' "$CREDS_FILE"
+        if [ -n "$COOLIFY_REGISTERED" ]; then
+            printf '  Estado ............ usuario registrado, listo para entrar\n'
+        elif [ -z "$SKIP_COOLIFY" ]; then
+            printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
+            printf '                      el email y contraseña de las credenciales\n'
+            printf '                      (el primer usuario registrado es el propietario).\n'
+        fi
+        printf '\nAPPS\n'
+        printf '  Patrón de dominio . https://<lo-que-sea>.%s.%s\n' "$APP_SUBDOMAIN" "$ROOT_DOMAIN"
+        printf '  Al crear una app en Coolify, ponle un dominio con ese patrón:\n'
+        printf '  el comodín ya está enrutado, no hay que tocar DNS por cada app.\n'
+        printf '\nCLOUDFLARE TUNNEL\n'
+        printf '  Zona .............. %s\n' "$ROOT_DOMAIN"
+        printf '  Tunnel ID ......... %s\n' "${TUNNEL_ID:-omitido}"
+        printf '  CNAME ............. %s y %s\n' "$APP_WILDCARD" "$COOLIFY_FQDN"
+        printf '\nESTADO DE SERVICIOS\n'
+        printf '  docker ............ %s\n' "$(svc_state docker)"
+        printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
+        printf '\nSECRETOS\n'
+        printf '  Credenciales ...... %s (modo 0600)\n' "$CREDS_FILE"
+        printf '  Guárdalas en un gestor de contraseñas y borra ese fichero.\n'
+        if [ -n "$KEEP_SECRETS" ]; then
+            printf '  Ficheros .......... CONSERVADOS por --keep-secrets:\n'
+            printf '                      %s\n' "$CONFIG_FILE"
+            printf '                      %s\n' "$TUNNEL_FILE"
+            [ -n "$IS_ROOT" ] && printf '                      %s\n' "$SETUP_ENV_FILE"
+            printf '                      Contienen el API Token de Cloudflare y el\n'
+            printf '                      token del túnel en claro. Bórralos a mano.\n'
+        else
+            printf '  Ficheros .......... borrados (token de Cloudflare, token del\n'
+            printf '                      túnel y configuración resuelta).\n'
+        fi
+        printf '  El token de Cloudflare ya no hace falta aquí: el túnel está creado.\n'
+        printf '  Puedes rotarlo sin romper nada.\n'
+        printf '\n  Log completo ...... %s\n' "$LOG_FILE"
+    } > "$SUMMARY_FILE"
+    chmod 600 "$SUMMARY_FILE"
 
+    {
+        printf '=== Credenciales — %s ===\n\n' "$(_ts)"
+        printf 'Contraseñas en claro. Guárdalas en un gestor de contraseñas y borra\n'
+        printf 'este fichero:  shred -u %s   (o rm -f)\n\n' "$CREDS_FILE"
+        printf 'SISTEMA\n'
+        printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
+        if [ -n "$ADMIN_PASSWORD" ]; then
+            printf '  Contraseña ........ %s\n' "$ADMIN_PASSWORD"
+        elif [ -n "$SSH_KEY" ]; then
+            printf '  Acceso ............ solo clave SSH (contraseña deshabilitada)\n'
+        else
+            printf '  Contraseña ........ sin cambios (el usuario ya existía)\n'
+        fi
+        printf '\nCOOLIFY\n'
+        printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
+        printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
+        printf '  Contraseña ........ %s\n' "$COOLIFY_PASSWORD"
+    } > "$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+}
+
+wipe_secrets() {
+    if [ -n "$KEEP_SECRETS" ]; then
+        warn "Se conservan los ficheros con secretos (--keep-secrets). Bórralos a mano."
+        return 0
+    fi
+    wipe_file "$CONFIG_FILE"
+    wipe_file "$TUNNEL_FILE"
+    [ -n "$IS_ROOT" ] && wipe_file "$SETUP_ENV_FILE"
+    note "Secretos borrados del disco; las credenciales quedan en $CREDS_FILE"
+    return 0
+}
+
+# El orden de estas tres líneas NO es negociable: primero se escriben resumen y
+# credenciales, luego la marca de completado, y solo entonces se borran los
+# secretos. Al revés, un fallo entre medias dejaría el equipo sin marca y sin
+# token: el servicio volvería a arrancar y pediría el token en bucle a alguien
+# que ya no lo tiene a mano.
+write_summaries
 touch "$DONE_MARKER"
-
-# Los secretos ya no hacen falta en disco: el resumen es la copia autorizada.
-rm -f "$CONFIG_FILE"
+wipe_secrets
 
 if [ -n "$HAS_SYSTEMD" ] && [ -n "$IS_ROOT" ]; then
     systemctl disable coolify-setup.service >/dev/null 2>&1 || true
@@ -1223,7 +1519,16 @@ fi
 
 printf '\n'
 cat "$SUMMARY_FILE"
-printf '\n%sResumen guardado en %s%s\n\n' "$C_BOLD" "$SUMMARY_FILE" "$C_RESET"
+if [ -n "$SUMMARY_NO_SECRETS" ]; then
+    printf '\n%sCredenciales en %s (no se imprimen: --summary-no-secrets)%s\n\n' \
+        "$C_BOLD" "$CREDS_FILE" "$C_RESET"
+else
+    printf '\n'
+    cat "$CREDS_FILE"
+    printf '\n'
+fi
+printf '%sResumen en %s — credenciales en %s%s\n\n' \
+    "$C_BOLD" "$SUMMARY_FILE" "$CREDS_FILE" "$C_RESET"
 
 # Con whiptail, dar tiempo a leer antes de que systemd limpie la consola.
 if [ "$UI" = whiptail ] || [ "$UI" = dialog ]; then
@@ -1232,7 +1537,8 @@ if [ "$UI" = whiptail ] || [ "$UI" = dialog ]; then
 Panel: https://$COOLIFY_FQDN
 Apps:  https://<nombre>.$APP_SUBDOMAIN.$ROOT_DOMAIN
 
-Resumen y credenciales en $SUMMARY_FILE"
+Resumen en $SUMMARY_FILE
+Credenciales en $CREDS_FILE (guárdalas y borra el fichero)"
 fi
 
 exit 0
