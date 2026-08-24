@@ -15,3 +15,6 @@
 # Basura del sistema operativo.
 .DS_Store
 Thumbs.db
+
+# Worktrees y estado de agentes de Claude Code.
+/.claude/
