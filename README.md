@@ -54,7 +54,9 @@ formulario. Ver [Qué está verificado y qué no](#qué-está-verificado-y-qué-
 1. El dominio dado de alta como zona en Cloudflare, con los nameservers apuntando allí.
 2. Un API Token con `Zone → DNS → Edit` y `Zone → Zone → Read` sobre esa zona.
    Se crea en <https://dash.cloudflare.com/profile/api-tokens>.
-3. La ISO de Ubuntu Server LTS: <https://ubuntu.com/download/server>.
+3. La ISO de Ubuntu **Server** LTS: <https://ubuntu.com/download/server>. La de
+   escritorio no vale: no lleva `subiquity` y el autoinstall no se aplica.
+   Verifícala antes de usarla ([abajo](#verificar-la-iso-de-ubuntu)).
 4. Ethernet conectado (recomendado). Si no, tendrás que teclear SSID y contraseña.
 
 No hace falta generar hashes de contraseña ni preparar nada más: la cuenta que
@@ -112,6 +114,63 @@ parámetros de arranque y el `/cidata` dentro.
 
 > Con el token horneado, la ISO **contiene un secreto**. No la subas a ningún
 > sitio y borra el USB al terminar.
+
+### Verificar la ISO de Ubuntu
+
+Todo lo que se instala después hereda la confianza de ese fichero: si la ISO
+está manipulada, da igual el resto, porque se instala un sistema comprometido y
+encima se le hornea dentro el token de Cloudflare.
+
+`build-usb.sh` comprueba **siempre**, antes de tocar nada, que el fichero sea de
+verdad una ISO9660 (marca `CD001` en el offset 32769), que el volume ID no sea
+el de una imagen de escritorio, que la arquitectura coincida, que no sea una
+descarga truncada y que dentro haya `/casper/vmlinuz` y `/boot/grub/grub.cfg`.
+Eso pilla los errores tontos, pero **no** demuestra que la ISO sea la de
+Canonical. Para eso:
+
+```bash
+# Contra un hash que ya tienes:
+./build-usb.sh --iso=ubuntu-24.04.4-live-server-amd64.iso \
+               --iso-sha256=e907d92eeec9df64163a7e454cbc8d7755e8ddc7ed42f99dbc80c40f1a138433
+
+# O que se baje solo SHA256SUMS y su firma y lo compruebe todo:
+./build-usb.sh --iso=ubuntu-24.04.4-live-server-amd64.iso --verify-iso
+```
+
+`--verify-iso` baja `SHA256SUMS` y `SHA256SUMS.gpg` de `releases.ubuntu.com`,
+valida la firma con la clave de Canonical
+(`843938DF228D22F7B3742BC0D94AA3F0EFE21092`) y busca el hash de tu ISO en la
+lista. **Si no hay `gpg`, verifica solo el hash y lo dice**: sin firma, quien
+pueda alterar la descarga de la ISO puede alterar también la lista. Si el hash
+no cuadra, no se genera nada, haya firma o no.
+
+<details>
+<summary>Hacerlo a mano, con los comandos exactos</summary>
+
+```bash
+# 1. Bajar la lista de hashes y su firma (ajusta la versión).
+curl -fLO https://releases.ubuntu.com/24.04.4/SHA256SUMS
+curl -fLO https://releases.ubuntu.com/24.04.4/SHA256SUMS.gpg
+
+# 2. Traer la clave de firma de las imágenes de Ubuntu.
+gpg --keyserver hkps://keyserver.ubuntu.com \
+    --recv-keys 843938DF228D22F7B3742BC0D94AA3F0EFE21092
+
+# 3. Comprobar que la lista la firmó Canonical. Tiene que decir
+#    "Good signature from Ubuntu CD Image Automatic Signing Key".
+gpg --verify SHA256SUMS.gpg SHA256SUMS
+
+# 4. Comprobar la ISO contra la lista ya verificada.
+sha256sum --ignore-missing -c SHA256SUMS     # Linux
+shasum -a 256 ubuntu-24.04.4-live-server-amd64.iso   # macOS: comparar a ojo
+```
+
+El paso 3 es el que importa: sin él solo estás comprobando que la ISO coincide
+con una lista que has bajado del mismo sitio. En el paso 2, `gpg` avisará de que
+la clave «no es de confianza» mientras no la firmes tú; eso es normal y no
+invalida la comprobación de integridad.
+
+</details>
 
 ### 2. Grabar el USB
 
@@ -233,6 +292,10 @@ Se adapta a lo que encuentre en la máquina:
 - **JSON**: `jq` del sistema, o `python3`, y si no hay ninguno **descarga `jq`
   al directorio de trabajo y lo usa desde ahí, sin instalarlo**.
 - **Interfaz**: `whiptail`, o `dialog`, o preguntas de texto plano.
+- **SHA-256** (en `build-usb.sh`): `sha256sum`, o `shasum -a 256`, o `openssl
+  dgst`, o `python3`. Si pides verificar y no hay ninguna, falla en vez de
+  seguir en silencio. `gpg` es opcional: sin él, `--verify-iso` comprueba el
+  hash y avisa de que la firma no se ha validado.
 
 `cloudflared` sí se instala en `/usr/local/bin`: no es andamiaje, es un servicio
 permanente, y una unidad de systemd apuntando a un directorio temporal se
@@ -244,7 +307,7 @@ que usar `--skip-docker` / `--skip-coolify`.
 ## Desarrollo
 
 ```bash
-make test    # 81 comprobaciones, sin dependencias obligatorias
+make test    # 89 comprobaciones, sin dependencias obligatorias
 make lint    # shellcheck en dialecto sh + sintaxis en varios shells
 make build   # genera cloud-init/user-data
 make iso ISO=ubuntu-24.04.4-live-server-amd64.iso
@@ -328,7 +391,7 @@ detalle, las implicaciones y un esbozo de solución.
 | [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
 | [#3](https://github.com/fompi/autounattended-coolify/issues/3) | **Secretos que sobreviven.** El token de Cloudflare queda en `/etc/coolify-setup.env`, el del túnel en `tunnel.env`, y las contraseñas en el resumen. Nada se borra. |
 | [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
-| [#8](https://github.com/fompi/autounattended-coolify/issues/8) | `build-usb.sh` no verifica la ISO de entrada. |
+| [#8](https://github.com/fompi/autounattended-coolify/issues/8) | *Resuelto.* `build-usb.sh` comprueba la ISO de entrada (ISO9660, edición, arquitectura, tamaño y contenido) y sabe verificar hash y firma con `--iso-sha256` / `--verify-iso`. Sigue sin ser obligatorio: quien no lo pida, no verifica. |
 | [#9](https://github.com/fompi/autounattended-coolify/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
 | [#12](https://github.com/fompi/autounattended-coolify/issues/12) | La geolocalización de la IP se hace por defecto y sin avisar. |
 
@@ -416,6 +479,10 @@ Probado ejecutándolo, no solo leyéndolo.
 - `build-usb.sh`: YAML válido, `setup.sh` incrustado idéntico byte a byte,
   parámetros de arranque y `/cidata` presentes en la ISO, sobrescritura al
   reejecutar, y guarda que impide destruir la ISO de origen.
+- Cordura de la ISO de entrada, con imágenes sintéticas hechas con `dd`: un
+  fichero que no es ISO, una de escritorio y una descarga truncada fallan con
+  un mensaje que dice qué hacer, y ninguna llega a borrar la ISO de salida
+  anterior. El helper de SHA-256 se compara con la herramienta del sistema.
 
 **No verificado:**
 
@@ -426,3 +493,6 @@ Probado ejecutándolo, no solo leyéndolo.
 - El registro automático del primer usuario de Coolify, que depende del HTML
   de su formulario y es la parte más frágil.
 - WiFi: no hay adaptador inalámbrico en la VM.
+- `--verify-iso` contra una ISO oficial **completa**: la descarga de
+  `SHA256SUMS` y la comparación del hash sí se han ejercitado, pero la
+  validación de la firma con `gpg` no se ha probado de punta a punta.

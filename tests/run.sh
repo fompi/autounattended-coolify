@@ -347,6 +347,79 @@ PY
     else
         bad "cloud-init/user-data esta en .gitignore" "podria subirse un token"
     fi
+
+    # --- Cordura de la ISO de entrada (#8) -------------------------------
+    # No hacen falta ISOs de verdad de 3 GB: se fabrican con dd las senales
+    # que mira build-usb.sh. Los tres casos mueren en las comprobaciones
+    # baratas, antes de llamar a xorriso, asi que esto corre igual en un
+    # equipo (o un runner) que no lo tenga instalado.
+    mkiso() { # mkiso FICHERO [VOLUME_ID]
+        dd if=/dev/zero of="$1" bs=1024 count=1024 2>/dev/null
+        if [ -n "${2:-}" ]; then
+            printf 'CD001' | dd of="$1" bs=1 seek=32769 conv=notrunc 2>/dev/null
+            printf '%s' "$2" | dd of="$1" bs=1 seek=32808 conv=notrunc 2>/dev/null
+        fi
+    }
+    build_iso() { # build_iso FICHERO -> salida combinada, nunca aborta
+        sh "$ROOT/build-usb.sh" --out="$OUT" --iso="$1" \
+            --iso-out="$TMP/no-deberia-existir.iso" 2>&1 || true
+    }
+
+    # 1. Un fichero que no es una ISO: ni siquiera lleva la marca ISO9660.
+    mkiso "$TMP/basura.iso"
+    st=0; sh "$ROOT/build-usb.sh" --out="$OUT" --iso="$TMP/basura.iso" \
+        --iso-out="$TMP/no-deberia-existir.iso" >/dev/null 2>&1 || st=$?
+    is "un fichero que no es ISO sale con rc=1" "1" "$st"
+    out=$(build_iso "$TMP/basura.iso")
+    case "$out" in
+        *ISO9660*) ok "un fichero que no es ISO: lo dice sin jerga de xorriso" ;;
+        *) bad "un fichero que no es ISO: lo dice sin jerga de xorriso" \
+               "$(printf '%s' "$out" | tail -2)" ;;
+    esac
+
+    # 2. La ISO de escritorio se llama 'Ubuntu ...', sin 'Server'. Ahi no hay
+    #    subiquity y el autoinstall no se aplicaria.
+    mkiso "$TMP/escritorio.iso" 'Ubuntu 24.04.4 LTS amd64'
+    out=$(build_iso "$TMP/escritorio.iso")
+    case "$out" in
+        *Desktop*Server*|*Server*Desktop*) ok "ISO de escritorio: pide la de Server" ;;
+        *) bad "ISO de escritorio: pide la de Server" "$(printf '%s' "$out" | tail -2)" ;;
+    esac
+    case "$out" in
+        *subiquity*) ok "ISO de escritorio: explica por que no vale" ;;
+        *) bad "ISO de escritorio: explica por que no vale" ;;
+    esac
+
+    # 3. Una Server de 1 MiB es una descarga a medias.
+    mkiso "$TMP/truncada.iso" 'Ubuntu-Server 24.04.4 LTS amd64'
+    out=$(build_iso "$TMP/truncada.iso")
+    case "$out" in
+        *"a medias"*) ok "descarga truncada: se detecta por el tamano" ;;
+        *) bad "descarga truncada: se detecta por el tamano" "$(printf '%s' "$out" | tail -2)" ;;
+    esac
+
+    # Lo importante de #8: nada de esto llega a tocar la ISO de salida.
+    if [ -e "$TMP/no-deberia-existir.iso" ]; then
+        bad "una ISO invalida no destruye la salida anterior"
+    else
+        ok "una ISO invalida no destruye la salida anterior"
+    fi
+
+    # Verificar sin ISO que verificar es un error de uso, no un silencio.
+    st=0; sh "$ROOT/build-usb.sh" --out="$OUT" --verify-iso >/dev/null 2>&1 || st=$?
+    is "--verify-iso sin --iso sale con rc=1" "1" "$st"
+
+    # El helper de hash tiene que coincidir con la herramienta del sistema.
+    eval "$(sed -n '/^sha256_of() {/,/^}/p' "$ROOT/build-usb.sh")"
+    ref=''
+    if have sha256sum; then ref=$(sha256sum "$TMP/basura.iso" | awk '{print $1}')
+    elif have shasum;  then ref=$(shasum -a 256 "$TMP/basura.iso" | awk '{print $1}')
+    fi
+    if [ -n "$ref" ]; then
+        is "sha256_of coincide con la herramienta del sistema" "$ref" "$(sha256_of "$TMP/basura.iso")"
+    else
+        skip "sha256_of" "no hay sha256sum ni shasum"
+    fi
 fi
 fi
 
