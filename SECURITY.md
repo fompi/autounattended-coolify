@@ -28,10 +28,40 @@ de root. Conviene tener claro qué protege y qué no.
   romper TLS, ejecuta código como root. Seguimiento en las incidencias.
 - **El token en el medio.** Con `--cf-token`, el token de Cloudflare viaja **en
   claro** dentro del `user-data` de la ISO. Quien tenga el USB lo tiene.
-- **El token en el disco.** Tras la instalación queda en
-  `/etc/coolify-setup.env` (modo 0600) y no se borra.
-- **Credenciales en el resumen.** `/root/instalacion-resumen.txt` guarda en
-  claro las contraseñas generadas, con modo 0600 y sin caducidad.
+- **Los secretos mientras dura la instalación.** Hasta que termina con éxito,
+  el token de Cloudflare está en `/etc/coolify-setup.env` y en
+  `/var/lib/coolify-setup/config.env`, y el del túnel en
+  `tunnel.env`, todos en modo 0600. Tienen que seguir ahí: son de donde sale el
+  reintento si algo falla a mitad.
+- **Credenciales tras la instalación.** Las contraseñas generadas quedan en
+  claro en `/root/instalacion-credenciales.txt` (modo 0600, propiedad de root)
+  y sin caducidad. Es un compromiso deliberado: sin ellas el equipo queda
+  inaccesible. Guárdalas en un gestor de contraseñas y borra el fichero.
+- **Borrado seguro.** Los secretos se borran con `shred -u` cuando está
+  disponible, pero sobre SSD, COW o sistemas con journal eso **no garantiza**
+  que el contenido desaparezca del medio físico.
+
+## Qué pasa con los secretos al terminar
+
+Al completar con éxito, y en este orden exacto:
+
+1. Se escribe `/root/instalacion-resumen.txt` **sin** credenciales y
+   `/root/instalacion-credenciales.txt` **con** ellas (0600).
+2. Se marca la instalación como completada.
+3. Se borran `config.env`, `tunnel.env` y `/etc/coolify-setup.env`.
+
+El orden importa: si se borrasen los secretos antes de marcar el completado y
+algo fallase en medio, el servicio de primer arranque volvería a ejecutarse y
+pediría el token en bucle. Si la instalación **falla** a mitad, no se borra
+nada: el reintento los necesita.
+
+`--keep-secrets` conserva los tres ficheros y lo dice en el resumen.
+`--summary-no-secrets` no imprime ninguna contraseña por pantalla (útil con la
+consola a la vista o grabándose); las credenciales van solo al fichero.
+
+**Rotar el token de Cloudflare después ya no hace falta**: una vez creado el
+túnel y los CNAME, el equipo no vuelve a usarlo. Rótalo igualmente si el USB o
+la ISO salieron de tu control.
 
 ## Llamadas salientes
 

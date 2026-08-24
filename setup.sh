@@ -28,11 +28,16 @@ if [ "$(id -u)" = "0" ]; then
     STATE_DIR=/var/lib/coolify-setup
     LOG_FILE=/var/log/coolify-setup.log
     SUMMARY_FILE=/root/instalacion-resumen.txt
+    CREDS_FILE=/root/instalacion-credenciales.txt
 else
     STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/coolify-setup"
     LOG_FILE="$STATE_DIR/setup.log"
     SUMMARY_FILE="$HOME/instalacion-resumen.txt"
+    CREDS_FILE="$HOME/instalacion-credenciales.txt"
 fi
+# Lo escribe el 'late-commands' del autoinstall y es de donde el servicio saca
+# el token al reintentar. Se borra solo al completar con exito.
+SETUP_ENV_FILE=/etc/coolify-setup.env
 WORK_DIR="$STATE_DIR/work"      # dependencias descargadas, no instaladas
 DONE_MARKER="$STATE_DIR/completed"
 
@@ -76,6 +81,18 @@ die() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Borra un fichero sobrescribiéndolo antes si el sistema trae shred. Aviso:
+# sobre SSD, COW o sistemas con journal, sobrescribir no garantiza nada — el
+# bloque original puede seguir vivo. Es una mejora, no una promesa.
+wipe_file() {
+    [ -n "${1:-}" ] && [ -e "$1" ] || return 0
+    if have shred && shred -u "$1" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$1"
+    return 0
+}
 
 # ============================================================================
 # Argumentos
@@ -125,6 +142,10 @@ CONTROL
   --skip-coolify         No instalar Coolify.
   --skip-tunnel          No crear el túnel de Cloudflare.
   --reset                Olvidar el estado previo y empezar de cero.
+  --keep-secrets         No borrar al terminar los ficheros con el token de
+                         Cloudflare, el del túnel y la configuración resuelta.
+  --summary-no-secrets   No imprimir contraseñas por pantalla al terminar; se
+                         quedan solo en el fichero de credenciales.
   --dry-run              Mostrar la configuración resuelta y salir.
   -h, --help             Esta ayuda.
 
@@ -152,6 +173,7 @@ COOLIFY_EMAIL=''; COOLIFY_PASSWORD=''
 ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
 NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
+KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 
 # Argumentos horneados en el USB al construirlo (via EnvironmentFile del
 # servicio systemd). Van delante para que lo que se pase a mano los pueda pisar.
@@ -196,6 +218,8 @@ while [ $# -gt 0 ]; do
         --skip-coolify)         SKIP_COOLIFY=1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
         --reset)                DO_RESET=1 ;;
+        --keep-secrets)         KEEP_SECRETS=1 ;;
+        --summary-no-secrets)   SUMMARY_NO_SECRETS=1 ;;
         --dry-run)              DRY_RUN=1 ;;
         -h|--help)              usage; exit 0 ;;
         *) usage >&2; die "Opción desconocida: $1" ;;
@@ -790,7 +814,7 @@ id "$ADMIN_USER" >/dev/null 2>&1 && ADMIN_USER_EXISTED=1
 # existe no se le toca la credencial.
 if [ -z "$ADMIN_PASSWORD" ] && [ -z "$ADMIN_USER_EXISTED" ] && [ -z "$SSH_KEY" ]; then
     ADMIN_PASSWORD=$(gen_password)
-    note "Contraseña de $ADMIN_USER generada (se mostrará en el resumen)"
+    note "Contraseña de $ADMIN_USER generada (irá al fichero de credenciales)"
 fi
 
 # Clave SSH ya presente en el sistema: reutilizarla en vez de pedirla.
@@ -852,7 +876,7 @@ valid_email "$COOLIFY_EMAIL" || die "Email de Coolify no válido: $COOLIFY_EMAIL
 
 if [ -z "$COOLIFY_PASSWORD" ]; then
     COOLIFY_PASSWORD=$(gen_password)
-    note "Contraseña de Coolify generada (se mostrará en el resumen)"
+    note "Contraseña de Coolify generada (irá al fichero de credenciales)"
 fi
 
 APP_WILDCARD="*.$APP_SUBDOMAIN.$ROOT_DOMAIN"
@@ -896,7 +920,8 @@ CONFIG_SUMMARY="Configuración resuelta:
   Panel Coolify ..... https://$COOLIFY_FQDN  ->  localhost:8000
   Email Coolify ..... $COOLIFY_EMAIL
 
-  Contraseñas generadas automáticamente; se mostrarán al terminar."
+  Contraseñas generadas automáticamente; al terminar quedan en
+  $CREDS_FILE (modo 0600), no en el resumen."
 
 printf '\n%s\n\n' "$CONFIG_SUMMARY"
 
@@ -1223,49 +1248,108 @@ svc_state() {
     else echo 'n/d'; fi
 }
 
-{
-    printf '=== Instalación completada — %s ===\n\n' "$(_ts)"
-    printf 'SISTEMA\n'
-    printf '  Hostname .......... %s\n' "$NEW_HOSTNAME"
-    printf '  Zona horaria ...... %s (origen: %s)\n' "$TIMEZONE" "$TIMEZONE_SOURCE"
-    printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
-    if [ -n "$ADMIN_PASSWORD" ]; then
-        printf '  Contraseña ........ %s\n' "$ADMIN_PASSWORD"
-    elif [ -n "$SSH_KEY" ]; then
-        printf '  Acceso ............ solo clave SSH (contraseña deshabilitada)\n'
-    else
-        printf '  Contraseña ........ sin cambios (el usuario ya existía)\n'
-    fi
-    printf '\nCOOLIFY\n'
-    printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
-    printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
-    printf '  Contraseña ........ %s\n' "$COOLIFY_PASSWORD"
-    if [ -n "$COOLIFY_REGISTERED" ]; then
-        printf '  Estado ............ usuario registrado, listo para entrar\n'
-    elif [ -z "$SKIP_COOLIFY" ]; then
-        printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
-        printf '                      el email y contraseña de arriba (el primer\n'
-        printf '                      usuario registrado es el propietario).\n'
-    fi
-    printf '\nAPPS\n'
-    printf '  Patrón de dominio . https://<lo-que-sea>.%s.%s\n' "$APP_SUBDOMAIN" "$ROOT_DOMAIN"
-    printf '  Al crear una app en Coolify, ponle un dominio con ese patrón:\n'
-    printf '  el comodín ya está enrutado, no hay que tocar DNS por cada app.\n'
-    printf '\nCLOUDFLARE TUNNEL\n'
-    printf '  Zona .............. %s\n' "$ROOT_DOMAIN"
-    printf '  Tunnel ID ......... %s\n' "${TUNNEL_ID:-omitido}"
-    printf '  CNAME ............. %s y %s\n' "$APP_WILDCARD" "$COOLIFY_FQDN"
-    printf '\nESTADO DE SERVICIOS\n'
-    printf '  docker ............ %s\n' "$(svc_state docker)"
-    printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
-    printf '\n  Log completo ...... %s\n' "$LOG_FILE"
-} > "$SUMMARY_FILE"
-chmod 600 "$SUMMARY_FILE"
+# El resumen se parte en dos a propósito. Uno se puede enseñar, pegar en un
+# ticket o dejar en pantalla; el otro tiene contraseñas en claro y hay que
+# tratarlo como lo que es.
+# Se aísla en una función para poder probarla: la suite la carga con eval y
+# comprueba que el resumen no lleva contraseñas y el de credenciales sí.
+write_summaries() {
+    {
+        printf '=== Instalación completada — %s ===\n\n' "$(_ts)"
+        printf 'SISTEMA\n'
+        printf '  Hostname .......... %s\n' "$NEW_HOSTNAME"
+        printf '  Zona horaria ...... %s (origen: %s)\n' "$TIMEZONE" "$TIMEZONE_SOURCE"
+        printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
+        if [ -n "$ADMIN_PASSWORD" ]; then
+            printf '  Acceso ............ contraseña generada (en %s)\n' "$CREDS_FILE"
+        elif [ -n "$SSH_KEY" ]; then
+            printf '  Acceso ............ solo clave SSH (contraseña deshabilitada)\n'
+        else
+            printf '  Acceso ............ sin cambios (el usuario ya existía)\n'
+        fi
+        printf '\nCOOLIFY\n'
+        printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
+        printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
+        printf '  Contraseña ........ en %s\n' "$CREDS_FILE"
+        if [ -n "$COOLIFY_REGISTERED" ]; then
+            printf '  Estado ............ usuario registrado, listo para entrar\n'
+        elif [ -z "$SKIP_COOLIFY" ]; then
+            printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
+            printf '                      el email y contraseña de las credenciales\n'
+            printf '                      (el primer usuario registrado es el propietario).\n'
+        fi
+        printf '\nAPPS\n'
+        printf '  Patrón de dominio . https://<lo-que-sea>.%s.%s\n' "$APP_SUBDOMAIN" "$ROOT_DOMAIN"
+        printf '  Al crear una app en Coolify, ponle un dominio con ese patrón:\n'
+        printf '  el comodín ya está enrutado, no hay que tocar DNS por cada app.\n'
+        printf '\nCLOUDFLARE TUNNEL\n'
+        printf '  Zona .............. %s\n' "$ROOT_DOMAIN"
+        printf '  Tunnel ID ......... %s\n' "${TUNNEL_ID:-omitido}"
+        printf '  CNAME ............. %s y %s\n' "$APP_WILDCARD" "$COOLIFY_FQDN"
+        printf '\nESTADO DE SERVICIOS\n'
+        printf '  docker ............ %s\n' "$(svc_state docker)"
+        printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
+        printf '\nSECRETOS\n'
+        printf '  Credenciales ...... %s (modo 0600)\n' "$CREDS_FILE"
+        printf '  Guárdalas en un gestor de contraseñas y borra ese fichero.\n'
+        if [ -n "$KEEP_SECRETS" ]; then
+            printf '  Ficheros .......... CONSERVADOS por --keep-secrets:\n'
+            printf '                      %s\n' "$CONFIG_FILE"
+            printf '                      %s\n' "$TUNNEL_FILE"
+            [ -n "$IS_ROOT" ] && printf '                      %s\n' "$SETUP_ENV_FILE"
+            printf '                      Contienen el API Token de Cloudflare y el\n'
+            printf '                      token del túnel en claro. Bórralos a mano.\n'
+        else
+            printf '  Ficheros .......... borrados (token de Cloudflare, token del\n'
+            printf '                      túnel y configuración resuelta).\n'
+        fi
+        printf '  El token de Cloudflare ya no hace falta aquí: el túnel está creado.\n'
+        printf '  Puedes rotarlo sin romper nada.\n'
+        printf '\n  Log completo ...... %s\n' "$LOG_FILE"
+    } > "$SUMMARY_FILE"
+    chmod 600 "$SUMMARY_FILE"
 
+    {
+        printf '=== Credenciales — %s ===\n\n' "$(_ts)"
+        printf 'Contraseñas en claro. Guárdalas en un gestor de contraseñas y borra\n'
+        printf 'este fichero:  shred -u %s   (o rm -f)\n\n' "$CREDS_FILE"
+        printf 'SISTEMA\n'
+        printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
+        if [ -n "$ADMIN_PASSWORD" ]; then
+            printf '  Contraseña ........ %s\n' "$ADMIN_PASSWORD"
+        elif [ -n "$SSH_KEY" ]; then
+            printf '  Acceso ............ solo clave SSH (contraseña deshabilitada)\n'
+        else
+            printf '  Contraseña ........ sin cambios (el usuario ya existía)\n'
+        fi
+        printf '\nCOOLIFY\n'
+        printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
+        printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
+        printf '  Contraseña ........ %s\n' "$COOLIFY_PASSWORD"
+    } > "$CREDS_FILE"
+    chmod 600 "$CREDS_FILE"
+}
+
+wipe_secrets() {
+    if [ -n "$KEEP_SECRETS" ]; then
+        warn "Se conservan los ficheros con secretos (--keep-secrets). Bórralos a mano."
+        return 0
+    fi
+    wipe_file "$CONFIG_FILE"
+    wipe_file "$TUNNEL_FILE"
+    [ -n "$IS_ROOT" ] && wipe_file "$SETUP_ENV_FILE"
+    note "Secretos borrados del disco; las credenciales quedan en $CREDS_FILE"
+    return 0
+}
+
+# El orden de estas tres líneas NO es negociable: primero se escriben resumen y
+# credenciales, luego la marca de completado, y solo entonces se borran los
+# secretos. Al revés, un fallo entre medias dejaría el equipo sin marca y sin
+# token: el servicio volvería a arrancar y pediría el token en bucle a alguien
+# que ya no lo tiene a mano.
+write_summaries
 touch "$DONE_MARKER"
-
-# Los secretos ya no hacen falta en disco: el resumen es la copia autorizada.
-rm -f "$CONFIG_FILE"
+wipe_secrets
 
 if [ -n "$HAS_SYSTEMD" ] && [ -n "$IS_ROOT" ]; then
     systemctl disable coolify-setup.service >/dev/null 2>&1 || true
@@ -1273,7 +1357,16 @@ fi
 
 printf '\n'
 cat "$SUMMARY_FILE"
-printf '\n%sResumen guardado en %s%s\n\n' "$C_BOLD" "$SUMMARY_FILE" "$C_RESET"
+if [ -n "$SUMMARY_NO_SECRETS" ]; then
+    printf '\n%sCredenciales en %s (no se imprimen: --summary-no-secrets)%s\n\n' \
+        "$C_BOLD" "$CREDS_FILE" "$C_RESET"
+else
+    printf '\n'
+    cat "$CREDS_FILE"
+    printf '\n'
+fi
+printf '%sResumen en %s — credenciales en %s%s\n\n' \
+    "$C_BOLD" "$SUMMARY_FILE" "$CREDS_FILE" "$C_RESET"
 
 # Con whiptail, dar tiempo a leer antes de que systemd limpie la consola.
 if [ "$UI" = whiptail ] || [ "$UI" = dialog ]; then
@@ -1282,7 +1375,8 @@ if [ "$UI" = whiptail ] || [ "$UI" = dialog ]; then
 Panel: https://$COOLIFY_FQDN
 Apps:  https://<nombre>.$APP_SUBDOMAIN.$ROOT_DOMAIN
 
-Resumen y credenciales en $SUMMARY_FILE"
+Resumen en $SUMMARY_FILE
+Credenciales en $CREDS_FILE (guárdalas y borra el fichero)"
 fi
 
 exit 0
