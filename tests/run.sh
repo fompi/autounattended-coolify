@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone resolution build latecommands
+# Grupos: syntax json validators timezone secrets resolution build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y el paso tunnel_service (habla con el edge real de Cloudflare).
@@ -45,7 +45,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone resolution build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets resolution build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -224,6 +224,132 @@ case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
 esac
 fi
 
+# --------------------------------------------------------------- secretos
+if want secrets; then
+group "Secretos: borrado, resumen partido y orden de #3"
+eval "$(sed -n '/^wipe_file() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^wipe_secrets() {/,/^}/p' "$ROOT/setup.sh")"
+have() { command -v "$1" >/dev/null 2>&1; }
+_ts() { echo '2026-01-01 00:00:00'; }
+svc_state() { echo activo; }
+warn() { :; }
+note() { :; }
+
+SEC="$TMP/sec"; mkdir -p "$SEC"
+
+# wipe_file: borra lo que hay y no se queja de lo que no.
+printf 'secreto\n' > "$SEC/victima"
+wipe_file "$SEC/victima"
+if [ -e "$SEC/victima" ]; then bad "wipe_file borra el fichero"; else ok "wipe_file borra el fichero"; fi
+st=0; wipe_file "$SEC/no-existe" || st=$?
+is "wipe_file devuelve 0 si no existe" "0" "$st"
+st=0; wipe_file "" || st=$?
+is "wipe_file devuelve 0 con argumento vacio" "0" "$st"
+
+# El resumen no puede llevar contrasenas; el de credenciales, si. Las
+# variables las consume write_summaries, cargada con eval: el analizador no
+# puede verlo, de ahi la directiva.
+# shellcheck disable=SC2034
+fake_config() {
+    NEW_HOSTNAME='maquina'
+    TIMEZONE='Europe/Madrid'
+    TIMEZONE_SOURCE='sistema'
+    ADMIN_USER='admin'
+    ADMIN_PASSWORD='CLAVEADMIN123'
+    SSH_KEY=''
+    COOLIFY_FQDN='coolify.fompi.net'
+    COOLIFY_EMAIL='a@b.com'
+    COOLIFY_PASSWORD='CLAVECOOLIFY456'
+    COOLIFY_REGISTERED=1
+    SKIP_COOLIFY=''
+    APP_SUBDOMAIN='app'
+    ROOT_DOMAIN='fompi.net'
+    APP_WILDCARD='*.app.fompi.net'
+    TUNNEL_ID='tid'
+    LOG_FILE="$SEC/log"
+    IS_ROOT=''
+    KEEP_SECRETS=''
+    SETUP_ENV_FILE="$SEC/etc-env"
+    SUMMARY_FILE="$SEC/resumen.txt"
+    CREDS_FILE="$SEC/credenciales.txt"
+    CONFIG_FILE="$SEC/config.env"
+    TUNNEL_FILE="$SEC/tunnel.env"
+}
+fake_config
+
+write_summaries
+if grep -q 'CLAVEADMIN123\|CLAVECOOLIFY456' "$SUMMARY_FILE"; then
+    bad "el resumen no lleva contrasenas" "$(grep -n 'CLAVE' "$SUMMARY_FILE" | head -2)"
+else
+    ok "el resumen no lleva contrasenas"
+fi
+if grep -q 'CLAVEADMIN123' "$CREDS_FILE" && grep -q 'CLAVECOOLIFY456' "$CREDS_FILE"; then
+    ok "las credenciales van a su propio fichero"
+else
+    bad "las credenciales van a su propio fichero"
+fi
+case "$(cat "$SUMMARY_FILE")" in
+    *"$CREDS_FILE"*) ok "el resumen dice donde estan las credenciales" ;;
+    *) bad "el resumen dice donde estan las credenciales" ;;
+esac
+if have stat; then
+    for f in "$SUMMARY_FILE" "$CREDS_FILE"; do
+        m=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null || echo '?')
+        is "$(basename "$f") queda en 0600" "600" "$m"
+    done
+fi
+
+# wipe_secrets: borra los tres, o los conserva si se pide.
+printf "CF_TOKEN='x'\n" > "$CONFIG_FILE"
+printf "TUNNEL_TOKEN='y'\n" > "$TUNNEL_FILE"
+KEEP_SECRETS=1
+wipe_secrets
+if [ -f "$CONFIG_FILE" ] && [ -f "$TUNNEL_FILE" ]; then
+    ok "--keep-secrets conserva los ficheros"
+else
+    bad "--keep-secrets conserva los ficheros"
+fi
+# shellcheck disable=SC2034
+KEEP_SECRETS=''
+wipe_secrets
+if [ -e "$CONFIG_FILE" ] || [ -e "$TUNNEL_FILE" ]; then
+    bad "sin --keep-secrets se borran config.env y tunnel.env"
+else
+    ok "sin --keep-secrets se borran config.env y tunnel.env"
+fi
+# Sin ser root no se toca /etc/coolify-setup.env: no es nuestro.
+printf 'CF_API_TOKEN=x\n' > "$SETUP_ENV_FILE"
+IS_ROOT=''; wipe_secrets
+if [ -f "$SETUP_ENV_FILE" ]; then ok "sin root no se toca /etc/coolify-setup.env"
+else bad "sin root no se toca /etc/coolify-setup.env"; fi
+# shellcheck disable=SC2034
+IS_ROOT=1
+wipe_secrets
+if [ -e "$SETUP_ENV_FILE" ]; then bad "como root se borra el env con el token"
+else ok "como root se borra el env con el token"; fi
+
+# El orden del camino de exito es lo critico de #3: si se borra el token antes
+# de marcar el completado y algo falla en medio, el servicio vuelve a arrancar
+# y pide el token en bucle.
+l_sum=$(grep -n '^write_summaries$' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_mark=$(grep -n '^touch "\$DONE_MARKER"$' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_wipe=$(grep -n '^wipe_secrets$' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ -n "$l_sum" ] && [ -n "$l_mark" ] && [ -n "$l_wipe" ] \
+   && [ "$l_sum" -lt "$l_mark" ] && [ "$l_mark" -lt "$l_wipe" ]; then
+    ok "orden resumen -> marca de completado -> borrado"
+else
+    bad "orden resumen -> marca de completado -> borrado" \
+        "resumen=${l_sum:-?} marca=${l_mark:-?} borrado=${l_wipe:-?}"
+fi
+for f in --keep-secrets --summary-no-secrets; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
 # --------------------------------------------------------------- resolucion
 if want resolution; then
 group "Resolucion de configuracion (contra la API simulada)"
@@ -321,6 +447,31 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
         *"*.nuevo.fompi.net"*) ok "los argumentos pisan lo guardado" ;;
         *) bad "los argumentos pisan lo guardado" "$(printf '%s' "$out" | grep Apps || true)" ;;
     esac
+
+    # #3: si el asistente falla a mitad, los secretos TIENEN que seguir ahi
+    # para que el reintento no vuelva a pedir el token. Sin --dry-run y sin
+    # root, el paso 'hostname' falla: es un fallo a mitad de verdad.
+    F="$TMP/fallo"
+    st=0; env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$F" \
+        HOME="$TMP" NO_COLOR=1 NO_GEOIP=1 sh "$ROOT/setup.sh" \
+        --cf-token=GOODTOKEN --domain=fompi.net --skip-docker --skip-coolify \
+        --skip-tunnel --non-interactive >/dev/null 2>&1 || st=$?
+    is "un fallo a mitad sale con rc=1" "1" "$st"
+    if [ -f "$F/coolify-setup/config.env" ]; then
+        ok "tras un fallo a mitad config.env sigue ahi"
+    else
+        bad "tras un fallo a mitad config.env sigue ahi" "el reintento pediria el token otra vez"
+    fi
+    if grep -q "CF_TOKEN='GOODTOKEN'" "$F/coolify-setup/config.env" 2>/dev/null; then
+        ok "y conserva el token para el reintento"
+    else
+        bad "y conserva el token para el reintento"
+    fi
+    if [ -e "$F/coolify-setup/completed" ]; then
+        bad "tras un fallo a mitad NO hay marca de completado"
+    else
+        ok "tras un fallo a mitad NO hay marca de completado"
+    fi
 
     kill "$MOCK_PID" 2>/dev/null; MOCK_PID=''
 fi

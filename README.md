@@ -41,11 +41,11 @@ formulario. Ver [Qué está verificado y qué no](#qué-está-verificado-y-qué-
 | Subdominio del panel | `coolify` por defecto (`--coolify-subdomain`). |
 | Hostname | Primera etiqueta del hostname actual si no es genérico; si lo es, primera etiqueta del dominio. |
 | Usuario administrador | `SUDO_USER`, o el primer usuario con uid ≥ 1000, o se crea `admin`. |
-| Contraseña del admin | Generada (24 caracteres). Aparece en el resumen final. |
+| Contraseña del admin | Generada (24 caracteres). Aparece en `/root/instalacion-credenciales.txt`. |
 | Clave SSH | Se respeta la que ya haya en `authorized_keys`; si se pasa `--ssh-key`, se desactiva el acceso por contraseña. |
 | Zona horaria | La del sistema; si el sistema está en UTC, geolocalización de la IP pública (evitable con `--no-geoip`); si falla, UTC. |
 | Email del admin de Coolify | Extraído del nombre de la cuenta de Cloudflare; si no, `admin@<dominio>`. |
-| Contraseña de Coolify | Generada. Aparece en el resumen final. |
+| Contraseña de Coolify | Generada. Aparece en `/root/instalacion-credenciales.txt`. |
 | Tunnel ID, rutas DNS, tokens internos | Creados vía API. |
 | WiFi | **Solo se pregunta si no hay red al arrancar.** Con Ethernet ni se menciona. |
 
@@ -225,8 +225,9 @@ tendrás que teclear `yes` una vez.
 3. **Instalación automática**: Docker, Coolify, cloudflared, túnel y DNS.
    Coolify tarda varios minutos en levantar sus contenedores.
 4. **Resumen final** en pantalla y en `/root/instalacion-resumen.txt`: URLs,
-   credenciales generadas, estado de cada servicio y el patrón de dominio para
-   las apps.
+   estado de cada servicio y el patrón de dominio para las apps. Las
+   credenciales generadas van aparte, a `/root/instalacion-credenciales.txt`
+   (modo 0600); guárdalas en un gestor de contraseñas y borra el fichero.
 
 Después, el servicio se autodesactiva y no vuelve a ejecutarse.
 
@@ -377,6 +378,12 @@ Sin ella, la única vía es el modo de recuperación de GRUB (mantén
   momento de la instalación. Con `--timezone=Europe/Madrid` o con `--no-geoip`
   (o `NO_GEOIP=1`) no se hace nunca. `SECURITY.md` enumera todas las llamadas
   salientes del script.
+- **Secretos al terminar.** El resumen se parte en dos: `instalacion-resumen.txt`
+  (sin credenciales, se puede enseñar) e `instalacion-credenciales.txt` (0600,
+  con las contraseñas). Al completar con éxito se borran el token de Cloudflare
+  y el del túnel del disco; con `--keep-secrets` se conservan y el resumen lo
+  advierte. Si la instalación falla a mitad **no se borra nada**: el reintento
+  los necesita.
 - **Secretos en `ps`.** Un `--cf-token=xxx` literal es visible para otros
   usuarios de la máquina. Usa `@fichero`, `@-` o la variable de entorno.
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
@@ -392,7 +399,6 @@ detalle, las implicaciones y un esbozo de solución.
 | | Qué pasa |
 |---|---|
 | [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
-| [#3](https://github.com/fompi/autounattended-coolify/issues/3) | **Secretos que sobreviven.** El token de Cloudflare queda en `/etc/coolify-setup.env`, el del túnel en `tunnel.env`, y las contraseñas en el resumen. Nada se borra. |
 | [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
 | [#8](https://github.com/fompi/autounattended-coolify/issues/8) | *Resuelto.* `build-usb.sh` comprueba la ISO de entrada (ISO9660, edición, arquitectura, tamaño y contenido) y sabe verificar hash y firma con `--iso-sha256` / `--verify-iso`. Sigue sin ser obligatorio: quien no lo pida, no verifica. |
 | [#9](https://github.com/fompi/autounattended-coolify/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
