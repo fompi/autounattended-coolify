@@ -363,6 +363,16 @@ Sin ella, la única vía es el modo de recuperación de GRUB (mantén
 <kbd>Shift</kbd> al arrancar → *Advanced options* → *recovery mode* →
 *root shell*).
 
+La puerta de servicio **se cierra sola**. El último paso del asistente, ya con
+todo lo demás terminado, comprueba que tu usuario administrador existe, manda
+(sudo/wheel/admin) y tiene con qué entrar (contraseña real o `authorized_keys`);
+solo entonces bloquea `installer`, la saca de sudo y le pone una shell que no
+deja iniciar sesión. Si no puede verificarlo, **no la toca** y lo dice en el
+resumen: prefiere una cuenta de rescate viva a un equipo inaccesible. Si el
+asistente falló a mitad, `installer` sigue utilizable a propósito y tendrás que
+retirarla a mano. `--purge-installer` la borra con su home, `--keep-rescue` la
+conserva tal cual, y `--installer-user=NOMBRE` sirve si le pusiste otro nombre.
+
 ## Cosas que conviene saber
 
 - **El primer usuario de Coolify.** Coolify no expone API para crearlo: su token
@@ -401,7 +411,6 @@ detalle, las implicaciones y un esbozo de solución.
 | [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
 | [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
 | [#8](https://github.com/fompi/autounattended-coolify/issues/8) | *Resuelto.* `build-usb.sh` comprueba la ISO de entrada (ISO9660, edición, arquitectura, tamaño y contenido) y sabe verificar hash y firma con `--iso-sha256` / `--verify-iso`. Sigue sin ser obligatorio: quien no lo pida, no verifica. |
-| [#9](https://github.com/fompi/autounattended-coolify/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
 
 ### Sin verificar
 
