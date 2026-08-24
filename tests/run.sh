@@ -486,6 +486,159 @@ if grep -q 'OS_N" != linux' "$TMP/cfbin.sh"; then
 else
     bad "do_cloudflared_bin tiene guarda de sistema operativo" "en macOS moriria con un 404"
 fi
+
+# --- verificacion de integridad (#2) -------------------------------------
+# Las funciones se cargan en este shell con eval, como en los demas grupos.
+eval "$(sed -n '/^sha256_of() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^verify_sha256() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^known_sha256() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^verify_artifact() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^warn_unverified() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^fetch_artifact() {/,/^}/p' "$ROOT/setup.sh")"
+
+D="$TMP/dl"; mkdir -p "$D"
+VLOG="$D/diag"
+: > "$VLOG"
+# Diagnostico capturado: asi se puede comprobar que el aviso se emite de verdad
+# y no solo que la funcion devuelve 0.
+_logfile() { printf 'LOG: %s\n' "$*" >> "$VLOG"; }
+err()  { printf 'ERR: %s\n' "$*" >> "$VLOG"; }
+warn() { printf 'WARN: %s\n' "$*" >> "$VLOG"; }
+note() { printf 'NOTE: %s\n' "$*" >> "$VLOG"; }
+info() { printf 'INFO: %s\n' "$*" >> "$VLOG"; }
+have_real() { command -v "$1" >/dev/null 2>&1; }
+have() { have_real "$1"; }
+
+# SHA-256 del fichero vacio. Es una constante publica y conocida: sirve de
+# vector de prueba sin tener que calcularla con la misma herramienta que se
+# esta probando, que seria circular.
+EMPTY_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+: > "$D/vacio"
+
+n=0
+for tool in sha256sum shasum openssl; do
+    have_real "$tool" || continue
+    # Se fuerza un backend concreto haciendo que 'have' solo reconozca ese.
+    eval "have() { [ \"\$1\" = $tool ] && have_real $tool; }"
+    is "sha256_of via $tool" "$EMPTY_SHA" "$(sha256_of "$D/vacio")"
+    n=$((n+1))
+done
+have() { have_real "$1"; }
+if [ "$n" -gt 0 ]; then
+    ok "hay al menos una herramienta de hash ($n probada(s))"
+else
+    bad "hay al menos una herramienta de hash" "ni sha256sum ni shasum ni openssl"
+fi
+
+# Hash correcto: rc=0 y el fichero sigue ahi.
+st=0; verify_sha256 "$D/vacio" "$EMPTY_SHA" || st=$?
+is "hash correcto devuelve 0" "0" "$st"
+if [ -f "$D/vacio" ]; then ok "hash correcto conserva el fichero"
+else bad "hash correcto conserva el fichero"; fi
+
+# Hash que no cuadra: rc!=0 y el fichero DESAPARECE. Dejarlo seria dejar puesta
+# la trampa para el paso siguiente, que es justo lo que se quiere evitar.
+printf 'binario falsificado\n' > "$D/malo"
+: > "$VLOG"
+st=0; verify_sha256 "$D/malo" "$EMPTY_SHA" || st=$?
+is "hash que no cuadra devuelve !=0" "1" "$st"
+if [ -e "$D/malo" ]; then bad "un hash que no cuadra borra el fichero" "quedo instalado"
+else ok "un hash que no cuadra borra el fichero"; fi
+if grep -q 'ERR: .*esperado' "$VLOG" && grep -q 'ERR: .*obtenido' "$VLOG"; then
+    ok "y dice el esperado y el obtenido"
+else
+    bad "y dice el esperado y el obtenido" "$(head -3 "$VLOG")"
+fi
+
+# Sin NINGUNA herramienta de hash tiene que fallar, no continuar a ciegas.
+# Se simula redefiniendo 'have', no vaciando el PATH: vaciarlo rompe tambien
+# el rm de la propia funcion en shells sin builtin.
+printf 'contenido\n' > "$D/sinhash"
+: > "$VLOG"
+have() { return 1; }
+st=0; verify_sha256 "$D/sinhash" "$EMPTY_SHA" || st=$?
+have() { have_real "$1"; }
+is "sin herramienta de hash falla" "1" "$st"
+if [ -e "$D/sinhash" ]; then bad "sin herramienta de hash tampoco deja el fichero"
+else ok "sin herramienta de hash tampoco deja el fichero"; fi
+if grep -q 'No se continúa sin verificar' "$VLOG"; then
+    ok "y lo dice en vez de callarse"
+else
+    bad "y lo dice en vez de callarse" "$(head -3 "$VLOG")"
+fi
+
+# La tabla tiene que cubrir lo que el script descarga por defecto, en las dos
+# arquitecturas. Un hueco aqui significa una instalacion que aborta.
+for k in cloudflared-2026.8.2-linux-amd64 cloudflared-2026.8.2-linux-arm64 \
+         jq-1.7.1-jq-linux-amd64 jq-1.7.1-jq-linux-arm64 \
+         jq-1.7.1-jq-macos-amd64 jq-1.7.1-jq-macos-arm64; do
+    h=$(known_sha256 "$k" 2>/dev/null || true)
+    case "$h" in
+        ????????????????????????????????????????????????????????????????)
+            ok "hay hash conocido para $k" ;;
+        *)  bad "hay hash conocido para $k" "obtenido [$h]" ;;
+    esac
+done
+st=0; known_sha256 cloudflared-9999.1.1-linux-amd64 >/dev/null || st=$?
+is "una version desconocida no inventa hash" "1" "$st"
+
+# El pin de la linea de comandos manda sobre la tabla: es lo que permite pedir
+# una version que este script no conoce sin renunciar a verificar.
+: > "$D/pin"
+st=0; verify_artifact "$D/pin" cloudflared-9999.1.1-linux-amd64 "$EMPTY_SHA" || st=$?
+is "el pin a mano permite una version desconocida" "0" "$st"
+: > "$D/nopin"
+: > "$VLOG"
+st=0; verify_artifact "$D/nopin" cloudflared-9999.1.1-linux-amd64 '' || st=$?
+is "sin pin ni tabla, aborta" "1" "$st"
+if [ -e "$D/nopin" ]; then bad "sin pin ni tabla no deja el fichero"
+else ok "sin pin ni tabla no deja el fichero"; fi
+
+# Docker y Coolify no tienen artefacto verificable: lo minimo es decirlo, por
+# pantalla y en el log. Antes no se decia nada en ninguno de los dos sitios.
+: > "$VLOG"
+warn_unverified Docker https://get.docker.com --pin-docker
+if grep -q 'WARN: SIN VERIFICAR' "$VLOG" && grep -q 'pin-docker' "$VLOG"; then
+    ok "sin pin se avisa y se dice como fijarlo"
+else
+    bad "sin pin se avisa y se dice como fijarlo" "$(head -3 "$VLOG")"
+fi
+sed -n '/^do_docker() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/dodocker.sh"
+sed -n '/^do_coolify() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/docoolify.sh"
+for f in dodocker docoolify; do
+    if grep -q 'warn_unverified' "$TMP/$f.sh" && grep -q 'verify_sha256' "$TMP/$f.sh"; then
+        ok "$f: pin si lo hay, aviso si no"
+    else
+        bad "$f: pin si lo hay, aviso si no"
+    fi
+done
+
+# --offline-dir: coge el artefacto del directorio y no toca la red.
+OFF="$D/offline"; mkdir -p "$OFF"
+printf 'soy el instalador\n' > "$OFF/get-docker.sh"
+OFFLINE_DIR="$OFF"
+fetch_file() { bad "fetch_artifact ha ido a la red con --offline-dir puesto"; return 1; }
+st=0; fetch_artifact https://get.docker.com "$D/traido" get-docker.sh || st=$?
+is "--offline-dir trae el artefacto sin red" "0" "$st"
+is "y con el contenido correcto" "soy el instalador" "$(cat "$D/traido" 2>/dev/null || true)"
+: > "$VLOG"
+st=0; fetch_artifact https://get.docker.com "$D/nada" jq-linux-amd64 || st=$?
+is "--offline-dir sin el fichero falla" "1" "$st"
+if grep -q "no contiene 'jq-linux-amd64'" "$VLOG"; then
+    ok "y dice exactamente que fichero falta"
+else
+    bad "y dice exactamente que fichero falta" "$(head -3 "$VLOG")"
+fi
+# La consume fetch_artifact, cargada con eval: el analizador no puede verlo.
+# shellcheck disable=SC2034
+OFFLINE_DIR=''
+
+for f in --pin-docker --pin-coolify --pin-cloudflared --offline-dir; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
 fi
 
 # --------------------------------------------------------------- resolucion

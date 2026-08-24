@@ -147,6 +147,20 @@ COOLIFY
   --coolify-email=MAIL   Por defecto: se deduce de la cuenta CF, o admin@dominio
   --coolify-password=V   Por defecto: se genera. Acepta @fichero / @-.
 
+INTEGRIDAD DE LAS DESCARGAS
+  --pin-cloudflared=SHA  SHA-256 esperado del binario de cloudflared. Solo hace
+                         falta si pides una versión que este script no conoce.
+  --pin-docker=SHA       SHA-256 esperado de get-docker.sh.
+  --pin-coolify=SHA      SHA-256 esperado del install.sh de Coolify.
+                         Docker y Coolify NO publican hash por versión: sin pin
+                         se avisa por pantalla y en el log de que se ejecuta un
+                         script remoto sin verificar, y se continúa.
+  --offline-dir=RUTA     Coger los artefactos de ese directorio en vez de
+                         descargarlos. Ficheros esperados, con esos nombres:
+                         get-docker.sh, install-coolify.sh,
+                         cloudflared-linux-ARCH y jq-linux-ARCH. Se verifican
+                         exactamente igual que si vinieran de la red.
+
 CONTROL
   -y, --yes              No pedir confirmación final.
   --non-interactive      Fallar en vez de preguntar si falta algún dato.
@@ -200,6 +214,7 @@ SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 CLOUDFLARED_VERSION=''
+PIN_CLOUDFLARED=''; PIN_DOCKER=''; PIN_COOLIFY=''; OFFLINE_DIR=''
 
 # Argumentos horneados en el USB al construirlo (via EnvironmentFile del
 # servicio systemd). Van delante para que lo que se pase a mano los pueda pisar.
@@ -221,6 +236,14 @@ while [ $# -gt 0 ]; do
         --coolify-subdomain)    shift; COOLIFY_SUBDOMAIN=$1 ;;
         --cloudflared-version=*) CLOUDFLARED_VERSION=${1#*=} ;;
         --cloudflared-version)  shift; CLOUDFLARED_VERSION=$1 ;;
+        --pin-cloudflared=*)    PIN_CLOUDFLARED=${1#*=} ;;
+        --pin-cloudflared)      shift; PIN_CLOUDFLARED=$1 ;;
+        --pin-docker=*)         PIN_DOCKER=${1#*=} ;;
+        --pin-docker)           shift; PIN_DOCKER=$1 ;;
+        --pin-coolify=*)        PIN_COOLIFY=${1#*=} ;;
+        --pin-coolify)          shift; PIN_COOLIFY=$1 ;;
+        --offline-dir=*)        OFFLINE_DIR=${1#*=} ;;
+        --offline-dir)          shift; OFFLINE_DIR=$1 ;;
         --hostname=*)           NEW_HOSTNAME=${1#*=} ;;
         --hostname)             shift; NEW_HOSTNAME=$1 ;;
         --admin-user=*)         ADMIN_USER=${1#*=} ;;
@@ -341,6 +364,140 @@ PYEOF
     esac
 }
 
+# fetch_artifact URL DESTINO NOMBRE_LOCAL
+# Con --offline-dir el artefacto se coge de ese directorio y no se toca la red.
+# Lo que venga de ahi se verifica igual: un directorio local no es una fuente
+# de confianza por serlo, solo una que no depende de internet.
+fetch_artifact() {
+    if [ -n "$OFFLINE_DIR" ]; then
+        if [ ! -f "$OFFLINE_DIR/$3" ]; then
+            err "--offline-dir=$OFFLINE_DIR no contiene '$3'."
+            err "Descárgalo de $1 en una máquina con red y déjalo ahí con ese nombre."
+            return 1
+        fi
+        cp "$OFFLINE_DIR/$3" "$2" || return 1
+        note "'$3' tomado de $OFFLINE_DIR (sin red)"
+        return 0
+    fi
+    fetch_file "$1" "$2"
+}
+
+# ============================================================================
+# Integridad de las descargas
+# ============================================================================
+
+# Calcula el SHA-256 de un fichero. Se prueban tres herramientas porque ninguna
+# esta garantizada: sha256sum es de GNU coreutils, shasum viene con Perl (y es
+# lo normal en macOS y *BSD), y openssl esta en casi todas partes. Si no hay
+# NINGUNA devuelve !=0, y quien llama tiene que abortar: continuar sin poder
+# comprobar nada seria peor que no tener verificacion, porque la anunciariamos.
+sha256_of() {
+    _sf=$1; _sh=''
+    if have sha256sum; then
+        _sh=$(sha256sum "$_sf" 2>/dev/null) || return 1
+    elif have shasum; then
+        _sh=$(shasum -a 256 "$_sf" 2>/dev/null) || return 1
+    elif have openssl; then
+        # 'SHA2-256(fichero)= hash' en OpenSSL 3, 'SHA256(fichero)= hash' antes.
+        _sh=$(openssl dgst -sha256 "$_sf" 2>/dev/null) || return 1
+        _sh=${_sh##*= }
+    else
+        return 1
+    fi
+    _sh=${_sh%% *}
+    [ -n "$_sh" ] || return 1
+    printf '%s' "$_sh"
+}
+
+# verify_sha256 FICHERO HASH_ESPERADO
+# Si no cuadra, o si no hay con que calcularlo, BORRA el fichero y falla. Lo
+# de borrarlo no es celo: dejar en el disco un binario que no hemos podido
+# verificar es dejar puesta la trampa para el siguiente paso.
+verify_sha256() {
+    _vf=$1; _vexp=$2
+    if ! _vgot=$(sha256_of "$_vf"); then
+        rm -f "$_vf"
+        err "No hay sha256sum, shasum ni openssl: no se puede verificar $_vf."
+        err "Instala coreutils, perl u openssl. No se continúa sin verificar."
+        return 1
+    fi
+    if [ "$_vgot" != "$_vexp" ]; then
+        rm -f "$_vf"
+        err "SHA-256 incorrecto en $_vf — el fichero se ha borrado."
+        err "  esperado: $_vexp"
+        err "  obtenido: $_vgot"
+        return 1
+    fi
+    _logfile "SHA-256 verificado: $_vf = $_vgot"
+    return 0
+}
+
+# Hashes conocidos, por artefacto-version-plataforma.
+#
+# La tabla vive DENTRO de este script a proposito: el script viaja solo (por
+# 'curl | sh', o incrustado en el user-data del USB) y no tiene al lado ningun
+# repositorio del que leer un checksums.txt.
+#
+# La procedencia NO es la misma para los dos, y la diferencia importa:
+#   - jq: copiados del sha256sum.txt que publica la propia release de jqlang/jq.
+#     Eso es verificacion contra lo que dice el autor.
+#   - cloudflared: calculados a mano descargando los binarios el 2026-08-24,
+#     porque Cloudflare NO publica hashes de sus releases. Eso es "confianza en
+#     el primer uso": fija lo que habia ese dia y detecta que cambie despues,
+#     pero NO verifica contra ninguna fuente independiente. Ver SECURITY.md.
+known_sha256() {
+    case "$1" in
+    cloudflared-2026.8.2-linux-amd64)
+        printf '%s' fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2 ;;
+    cloudflared-2026.8.2-linux-arm64)
+        printf '%s' 7747d94570fb390cf47dcb4f9555c193c6355cda9793f0d878d9049e5d6a7790 ;;
+    jq-1.7.1-jq-linux-amd64)
+        printf '%s' 5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5 ;;
+    jq-1.7.1-jq-linux-arm64)
+        printf '%s' 4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5 ;;
+    jq-1.7.1-jq-macos-amd64)
+        printf '%s' 4155822bbf5ea90f5c79cf254665975eb4274d426d0709770c21774de5407443 ;;
+    jq-1.7.1-jq-macos-arm64)
+        printf '%s' 0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a ;;
+    *)  return 1 ;;
+    esac
+}
+
+# verify_artifact FICHERO CLAVE [PIN_A_MANO]
+# El pin de la linea de comandos manda sobre la tabla: sirve para instalar una
+# version que este script no conoce sin renunciar a verificar.
+verify_artifact() {
+    _af=$1; _ak=$2; _ap=${3:-}
+    if [ -n "$_ap" ]; then
+        verify_sha256 "$_af" "$_ap" || return 1
+        note "SHA-256 verificado contra el pin indicado a mano"
+        return 0
+    fi
+    if ! _ah=$(known_sha256 "$_ak"); then
+        rm -f "$_af"
+        err "No hay hash conocido para '$_ak' y no se ha indicado ninguno."
+        err "Comprueba tú el fichero y pásalo con el --pin-... correspondiente,"
+        err "o pide una versión de las que este script trae en su tabla."
+        return 1
+    fi
+    verify_sha256 "$_af" "$_ah" || return 1
+    note "SHA-256 verificado contra la tabla ($_ak)"
+    return 0
+}
+
+# warn_unverified NOMBRE URL FLAG
+# Docker y Coolify sirven un script que cambia continuamente y no publican hash
+# por version: no hay pin honesto que traer de fabrica. Sin pin no se bloquea
+# la instalacion, pero se dice en voz alta lo que se va a hacer — por pantalla
+# y en el log, que antes no se decia nada en ninguno de los dos sitios.
+warn_unverified() {
+    warn "SIN VERIFICAR: se va a ejecutar como root un script descargado de $2"
+    warn "  $1 no publica un hash por versión: no hay nada contra lo que"
+    warn "  comprobarlo. Si quieres fijarlo, calcula el SHA-256 una vez y"
+    warn "  pásalo con $3=SHA256 (ver SECURITY.md)."
+    return 0
+}
+
 # ============================================================================
 # JSON: jq del sistema > python3 > jq descargado al workdir
 # ============================================================================
@@ -371,8 +528,11 @@ setup_json() {
         esac
         [ -n "$jq_plat" ] || die "Sin jq ni python disponibles y no hay binario de jq para $OS_N/$ARCH_N."
         info "Descargando jq a $WORK_DIR (uso temporal, no se instala)"
-        fetch_file "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/$jq_plat" "$WORK_DIR/jq" \
-            || die "No se pudo descargar jq $JQ_VERSION."
+        fetch_artifact "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/$jq_plat" \
+            "$WORK_DIR/jq" "$jq_plat" \
+            || die "No se pudo obtener jq $JQ_VERSION."
+        verify_artifact "$WORK_DIR/jq" "jq-$JQ_VERSION-$jq_plat" \
+            || die "jq no supera la verificación de integridad."
         chmod +x "$WORK_DIR/jq"
         JQ="$WORK_DIR/jq"; JSON_MODE=jq
     fi
@@ -747,7 +907,8 @@ if [ -f "$CONFIG_FILE" ]; then
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
               NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
               WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD \
-              INSTALLER_USER CLOUDFLARED_VERSION; do
+              INSTALLER_USER CLOUDFLARED_VERSION \
+              PIN_CLOUDFLARED PIN_DOCKER PIN_COOLIFY OFFLINE_DIR; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
     done
@@ -757,6 +918,13 @@ fi
 : "${APP_SUBDOMAIN:=app}"
 : "${INSTALLER_USER:=installer}"
 : "${CLOUDFLARED_VERSION:=$CLOUDFLARED_VERSION_DEFAULT}"
+
+# Absoluta: el servicio de systemd arranca el reintento desde / y una ruta
+# relativa guardada en config.env dejaria de resolver.
+if [ -n "$OFFLINE_DIR" ]; then
+    OFFLINE_DIR=$(CDPATH='' cd -- "$OFFLINE_DIR" 2>/dev/null && pwd) \
+        || die "--offline-dir: no se puede entrar en el directorio indicado."
+fi
 : "${COOLIFY_SUBDOMAIN:=coolify}"
 
 info "Resolviendo configuración"
@@ -1001,6 +1169,10 @@ COOLIFY_EMAIL='$COOLIFY_EMAIL'
 COOLIFY_PASSWORD='$(printf '%s' "$COOLIFY_PASSWORD" | sed "s/'/'\\\\''/g")'
 INSTALLER_USER='$INSTALLER_USER'
 CLOUDFLARED_VERSION='$CLOUDFLARED_VERSION'
+PIN_CLOUDFLARED='$PIN_CLOUDFLARED'
+PIN_DOCKER='$PIN_DOCKER'
+PIN_COOLIFY='$PIN_COOLIFY'
+OFFLINE_DIR='$(printf '%s' "$OFFLINE_DIR" | sed "s/'/'\\\\''/g")'
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -1135,7 +1307,13 @@ do_docker() {
     else
         need_root || return 1
         [ "$OS_N" = linux ] || { err "La instalación automática de Docker solo está soportada en Linux. En macOS instala Docker Desktop y reejecuta con --skip-docker."; return 1; }
-        fetch_file "https://get.docker.com" "$WORK_DIR/get-docker.sh" || return 1
+        fetch_artifact "https://get.docker.com" "$WORK_DIR/get-docker.sh" get-docker.sh || return 1
+        if [ -n "$PIN_DOCKER" ]; then
+            verify_sha256 "$WORK_DIR/get-docker.sh" "$PIN_DOCKER" || return 1
+            ok "get-docker.sh verificado contra --pin-docker"
+        else
+            warn_unverified Docker https://get.docker.com --pin-docker
+        fi
         sh "$WORK_DIR/get-docker.sh" || return 1
     fi
     if [ -n "$HAS_SYSTEMD" ]; then
@@ -1164,7 +1342,14 @@ do_coolify() {
     [ "$OS_N" = linux ] || { err "Coolify solo se instala en Linux. Usa --skip-coolify en otros sistemas."; return 1; }
 
     if [ ! -d /data/coolify ]; then
-        fetch_file "https://cdn.coollabs.io/coolify/install.sh" "$WORK_DIR/install-coolify.sh" || return 1
+        fetch_artifact "https://cdn.coollabs.io/coolify/install.sh" \
+            "$WORK_DIR/install-coolify.sh" install-coolify.sh || return 1
+        if [ -n "$PIN_COOLIFY" ]; then
+            verify_sha256 "$WORK_DIR/install-coolify.sh" "$PIN_COOLIFY" || return 1
+            ok "install.sh de Coolify verificado contra --pin-coolify"
+        else
+            warn_unverified Coolify https://cdn.coollabs.io/coolify/install.sh --pin-coolify
+        fi
         # El instalador de Coolify requiere bash.
         have bash || { err "El instalador de Coolify necesita bash y no está disponible."; return 1; }
         bash "$WORK_DIR/install-coolify.sh" || return 1
@@ -1262,12 +1447,17 @@ do_cloudflared_bin() {
     asset="cloudflared-$OS_N-$ARCH_N"
     url="https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/$asset"
     info "Descargando cloudflared $CLOUDFLARED_VERSION ($OS_N/$ARCH_N)"
-    fetch_file "$url" "$dest.tmp" || {
-        err "No se pudo descargar cloudflared desde $url"
+    fetch_artifact "$url" "$dest.tmp" "$asset" || {
+        err "No se pudo obtener cloudflared desde $url"
         err "Comprueba que la versión '$CLOUDFLARED_VERSION' existe en las releases"
         err "de cloudflare/cloudflared, o indica otra con --cloudflared-version=X."
         return 1
     }
+    # Se verifica ANTES de mover: si no cuadra, verify_artifact borra el .tmp y
+    # en /usr/local/bin no queda nada. cloudflared no es andamiaje temporal, se
+    # instala como servicio permanente.
+    verify_artifact "$dest.tmp" "cloudflared-$CLOUDFLARED_VERSION-$OS_N-$ARCH_N" \
+        "$PIN_CLOUDFLARED" || return 1
     chmod +x "$dest.tmp" && mv "$dest.tmp" "$dest" || return 1
     "$dest" --version >/dev/null 2>&1 || { err "El binario descargado de cloudflared no funciona."; return 1; }
     CLOUDFLARED_BIN=$dest

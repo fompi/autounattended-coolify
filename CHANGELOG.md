@@ -29,6 +29,18 @@ Versionado [semántico](https://semver.org/lang/es/).
   `--keep-rescue`, `--purge-installer` e `--installer-user`. El paso nunca
   aborta la instalación y el resumen dice siempre cómo quedó la cuenta.
 
+### Seguridad
+- **Las descargas se verifican contra un SHA-256** ([#2]). `jq` contra el hash
+  que publica su release; `cloudflared` contra uno calculado por nosotros —que
+  es confianza en el primer uso, no verificación independiente: Cloudflare no
+  publica hashes—. Un hash que no cuadra aborta el paso y borra el fichero; si
+  no hay `sha256sum`, `shasum` ni `openssl`, falla en vez de continuar a
+  ciegas. Docker y Coolify no tienen artefacto verificable: nuevas
+  `--pin-docker` y `--pin-coolify`, y sin pin se avisa por pantalla y en el log
+  de que se ejecuta un script remoto como root sin verificar. Nuevas también
+  `--pin-cloudflared` y `--offline-dir`. `SECURITY.md` explica qué es
+  verificación de verdad y qué no.
+
 ### Cambiado
 - **`cloudflared` se instala en una versión fija** ([#5]), no desde
   `releases/latest`: la misma ISO tiene que dar el mismo sistema. Nueva
@@ -82,9 +94,10 @@ Versionado [semántico](https://semver.org/lang/es/).
 - Plantilla de autoinstall y `build-usb.sh`.
 
 [#1]: https://github.com/fompi/autounattended-coolify/issues/1
+[#2]: https://github.com/fompi/autounattended-coolify/issues/2
 [#3]: https://github.com/fompi/autounattended-coolify/issues/3
-[#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#5]: https://github.com/fompi/autounattended-coolify/issues/5
+[#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15

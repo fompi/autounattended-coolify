@@ -418,6 +418,16 @@ conserva tal cual, y `--installer-user=NOMBRE` sirve si le pusiste otro nombre.
   inventarse un modo de fallo tardío por no haber podido comprobar nada.
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
   una app en Coolify le pones un dominio con ese patrón y funciona sin tocar DNS.
+- **Integridad de lo que se instala.** `jq` y `cloudflared` se comprueban contra
+  un SHA-256 antes de usarse; si no cuadra, el paso aborta y el fichero se
+  borra, así que no queda nada sin verificar en el disco. Si en el sistema no
+  hay `sha256sum`, `shasum` ni `openssl`, falla en vez de continuar a ciegas.
+  Docker y Coolify no publican hash por versión: sin `--pin-docker` /
+  `--pin-coolify` se avisa por pantalla y en el log de que se va a ejecutar un
+  script remoto como root sin verificar. `--offline-dir=RUTA` coge los cuatro
+  artefactos de un directorio local, y los verifica igual. Los matices —qué es
+  verificación de verdad y qué es confianza en el primer uso— están en
+  `SECURITY.md`.
 - **Versiones fijadas.** `cloudflared` y `jq` se instalan en una versión concreta
   escrita en `setup.sh`, no en `latest`: la misma ISO tiene que dar el mismo
   sistema hoy y dentro de seis meses. El contrapeso es que **un pin envejece**:
@@ -434,7 +444,7 @@ detalle, las implicaciones y un esbozo de solución.
 
 | | Qué pasa |
 |---|---|
-| [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Ninguna descarga se verifica.** Docker, Coolify, `jq` y `cloudflared` se bajan y se ejecutan como root sin comprobar hash ni firma. La única protección es TLS. |
+| [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Verificación de descargas incompleta.** `jq` y `cloudflared` sí se comprueban contra un SHA-256, pero el de `cloudflared` lo calculamos nosotros (Cloudflare no publica hashes): es confianza en el primer uso, no verificación independiente. El script de Docker y el de Coolify **no se verifican** salvo que los fijes con `--pin-docker` / `--pin-coolify`. Detalle en `SECURITY.md`. |
 | [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
 | [#8](https://github.com/fompi/autounattended-coolify/issues/8) | *Resuelto.* `build-usb.sh` comprueba la ISO de entrada (ISO9660, edición, arquitectura, tamaño y contenido) y sabe verificar hash y firma con `--iso-sha256` / `--verify-iso`. Sigue sin ser obligatorio: quien no lo pida, no verifica. |
 
@@ -455,7 +465,8 @@ detalle, las implicaciones y un esbozo de solución.
 | [#14](https://github.com/fompi/autounattended-coolify/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
 | [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar ya no deja túneles huérfanos: el nombre sale del dominio, no del hostname. Lo que sigue faltando es un `--cleanup` que liste y borre, con confirmación, los túneles muertos que ya se hubieran acumulado; hoy eso se hace a mano en el panel de Cloudflare. |
 
-**Si vas a usarlo en serio**, lo mínimo antes es [#2](https://github.com/fompi/autounattended-coolify/issues/2),
+**Si vas a usarlo en serio**, lo mínimo antes es fijar Docker y Coolify con
+`--pin-docker` / `--pin-coolify` ([#2](https://github.com/fompi/autounattended-coolify/issues/2)),
 [#4](https://github.com/fompi/autounattended-coolify/issues/4) y
 [#6](https://github.com/fompi/autounattended-coolify/issues/6): integridad de lo que se
 instala, no quedar expuesto en la LAN, y comprobar que el túnel levanta de
