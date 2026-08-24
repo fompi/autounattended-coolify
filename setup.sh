@@ -62,6 +62,10 @@ fi
 SETUP_ENV_FILE=/etc/coolify-setup.env
 WORK_DIR="$STATE_DIR/work"      # dependencias descargadas, no instaladas
 DONE_MARKER="$STATE_DIR/completed"
+# En variables para que la suite pueda apuntarlas a un directorio de mentira y
+# probar los pasos sin ser root ni tocar el sistema de verdad.
+DOCKER_DAEMON_JSON=/etc/docker/daemon.json
+UNATTENDED_CONF=/etc/apt/apt.conf.d/51coolify-unattended
 
 # ============================================================================
 # Salida y registro
@@ -158,6 +162,11 @@ SISTEMA (todo opcional, todo derivado o generado si se omite)
   --installer-user=NOM   Cuenta de rescate creada por el autoinstall. Por
                          defecto: installer.
 
+MANTENIMIENTO
+  --no-unattended-upgrades  No configurar los parches automáticos de seguridad.
+  --auto-reboot=no|HH:MM Reiniciar solo si un parche lo exige, a esa hora.
+                         Por defecto: no (nunca reinicia solo).
+
 COOLIFY
   --coolify-email=MAIL   Por defecto: se deduce de la cuenta CF, o admin@dominio
   --coolify-password=V   Por defecto: se genera. Acepta @fichero / @-.
@@ -230,6 +239,7 @@ ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
 NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
 SKIP_COOLIFY_REGISTER=''
+NO_UNATTENDED=''; AUTO_REBOOT=no
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 CLOUDFLARED_VERSION=''
@@ -287,6 +297,9 @@ while [ $# -gt 0 ]; do
         --skip-docker)          SKIP_DOCKER=1 ;;
         --skip-coolify)         SKIP_COOLIFY=1 ;;
         --skip-coolify-register) SKIP_COOLIFY_REGISTER=1 ;;
+        --no-unattended-upgrades) NO_UNATTENDED=1 ;;
+        --auto-reboot=*)        AUTO_REBOOT=${1#*=} ;;
+        --auto-reboot)          shift; AUTO_REBOOT=$1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
         --reset)                DO_RESET=1 ;;
         --installer-user=*)     INSTALLER_USER=${1#*=} ;;
@@ -803,6 +816,13 @@ valid_label() {
 valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
+# 'no' o una hora HH:MM en 24h. Se valida antes de escribir nada: un valor
+# raro en Automatic-Reboot-Time deja unattended-upgrades sin aplicar parches y
+# sin decir por qué.
+valid_auto_reboot() {
+    [ "$1" = no ] && return 0
+    printf '%s' "$1" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+}
 
 # Nombre del túnel a partir del FQDN del panel. NO del hostname: reinstalar el
 # mini PC con otro hostname creaba un túnel nuevo y dejaba el viejo huérfano en
@@ -1161,6 +1181,9 @@ if [ -z "$COOLIFY_EMAIL" ]; then
 fi
 valid_email "$COOLIFY_EMAIL" || die "Email de Coolify no válido: $COOLIFY_EMAIL"
 
+valid_auto_reboot "$AUTO_REBOOT" \
+    || die "--auto-reboot: usa 'no' o una hora HH:MM en 24h. Recibido: $AUTO_REBOOT"
+
 # El nombre acaba en userdel/usermod: se valida antes de acercarlo a nada.
 printf '%s' "$INSTALLER_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_.-]*$' \
     || die "Nombre de cuenta de rescate no válido: $INSTALLER_USER"
@@ -1358,6 +1381,72 @@ do_docker() {
     docker info >/dev/null 2>&1 || { err "Docker instalado pero no responde."; return 1; }
 }
 run_step docker "Docker" do_docker
+
+# --- Configuración del demonio de Docker ---------------------------------
+# El driver json-file no tiene tope por defecto: los logs de los contenedores
+# crecen hasta llenar el disco, que es el fallo más probable del mes ocho
+# (#11). Va antes de Coolify porque aplicar esto exige reiniciar dockerd, y
+# reiniciarlo con Coolify ya en marcha es tirarle los contenedores encima.
+
+# El daemon.json que queremos. Suelto y puro para poder probarlo: que sea JSON
+# válido no se puede comprobar leyendo el script.
+docker_daemon_json() {
+    # Con printf y no con un heredoc a propósito: en un heredoc la llave de
+    # cierre del JSON iría a la columna 0, y la suite extrae las funciones con
+    # 'sed -n "/^nombre() {/,/^}/p"' — se comería la función por la mitad.
+    printf '%s\n' \
+        '{' \
+        '  "log-driver": "json-file",' \
+        '  "log-opts": { "max-size": "10m", "max-file": "3" }' \
+        '}'
+}
+
+do_docker_config() {
+    if [ -n "$SKIP_DOCKER" ]; then
+        note "omitido por --skip-docker"
+        state_set docker_logs 'omitido (--skip-docker)'
+        return 0
+    fi
+    need_root || return 1
+    if [ -s "$DOCKER_DAEMON_JSON" ]; then
+        # Si es exactamente el nuestro, es un reintento: no hay nada que hacer.
+        if docker_daemon_json | cmp -s - "$DOCKER_DAEMON_JSON"; then
+            state_set docker_logs 'json-file, max-size 10m, max-file 3'
+            ok "$DOCKER_DAEMON_JSON ya tiene el límite de logs"
+            return 0
+        fi
+        # Fusionar JSON ajeno a ciegas con sed o append es la forma más rápida
+        # de dejar a dockerd sin arrancar. Se avisa y se dice qué añadir.
+        warn "Ya existe $DOCKER_DAEMON_JSON con contenido: NO se toca."
+        warn "Los logs de los contenedores siguen SIN tope; hazlo tú."
+        note "Añade dentro del objeto de primer nivel:"
+        note '    "log-driver": "json-file",'
+        note '    "log-opts": { "max-size": "10m", "max-file": "3" }'
+        note "y luego: systemctl restart docker"
+        state_set docker_logs "SIN TOCAR: ya había $DOCKER_DAEMON_JSON (hazlo a mano)"
+        return 0
+    fi
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")" || return 1
+    docker_daemon_json > "$DOCKER_DAEMON_JSON" || return 1
+    chmod 644 "$DOCKER_DAEMON_JSON"
+    # daemon.json solo se lee al arrancar: sin reinicio no aplica nada.
+    if [ -n "$HAS_SYSTEMD" ]; then
+        systemctl restart docker || {
+            err "dockerd no arranca tras escribir $DOCKER_DAEMON_JSON."
+            err "Mira 'journalctl -u docker -n 50 --no-pager' y revisa ese fichero."
+            return 1
+        }
+    else
+        warn "Sin systemd no se reinicia dockerd: el límite no aplicará hasta que lo hagas."
+    fi
+    if have docker && ! docker info >/dev/null 2>&1; then
+        err "Docker no responde tras aplicar $DOCKER_DAEMON_JSON."
+        return 1
+    fi
+    state_set docker_logs 'json-file, max-size 10m, max-file 3'
+    return 0
+}
+run_step docker_config "Límite de logs de Docker" do_docker_config
 
 # --- Coolify --------------------------------------------------------------
 wait_for_http() {
@@ -1788,6 +1877,82 @@ do_tunnel_service() {
 }
 run_step tunnel_service "Servicio cloudflared" do_tunnel_service
 
+# --- Parches automáticos de seguridad -------------------------------------
+# Va AQUI, al final, y no junto al resto de la configuración del sistema: es lo
+# único de todo el script que llama a apt-get, y un apt-get compitiendo por el
+# lock de dpkg con el instalador de Docker o con el de Coolify no falla limpio,
+# cuelga las dos cosas. Cuando llega aquí ya no queda nadie usando dpkg.
+
+# El fichero de configuración, suelto para poder probarlo.
+# unattended_conf no|HH:MM
+unattended_conf() {
+    cat <<'EOF'
+// Escrito por setup.sh (#11). Solo parches de SEGURIDAD: en un equipo que
+// publica servicios importa más la previsibilidad que estar al día de todo.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+
+// Ojo: '#clear' NO es un comentario, es la directiva de apt para vaciar una
+// lista. Sin ella, lo de abajo se SUMARIA a lo que traiga 50unattended-upgrades
+// en vez de sustituirlo, y volverían a entrar orígenes que no son de seguridad.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+    };
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+    if [ "$1" = no ]; then
+        printf 'Unattended-Upgrade::Automatic-Reboot "false";\n'
+    else
+        printf 'Unattended-Upgrade::Automatic-Reboot "true";\n'
+        printf 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";\n'
+        printf 'Unattended-Upgrade::Automatic-Reboot-Time "%s";\n' "$1"
+    fi
+}
+
+do_updates() {
+    if [ -n "$NO_UNATTENDED" ]; then
+        note "omitido por --no-unattended-upgrades"
+        state_set updates 'omitido (--no-unattended-upgrades)'
+        return 0
+    fi
+    need_root || return 1
+    if [ "$OS_N" != linux ]; then
+        state_set updates 'omitido (solo automatizado en Linux)'
+        return 0
+    fi
+    if ! have apt-get; then
+        warn "No es un sistema con apt: los parches automáticos hay que montarlos a mano."
+        state_set updates 'omitido (no es un sistema apt)'
+        return 0
+    fi
+    if [ ! -x /usr/bin/unattended-upgrade ]; then
+        info "Instalando unattended-upgrades"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q unattended-upgrades </dev/null \
+            || { err "No se pudo instalar unattended-upgrades."; return 1; }
+    fi
+    mkdir -p "$(dirname "$UNATTENDED_CONF")" || return 1
+    unattended_conf "$AUTO_REBOOT" > "$UNATTENDED_CONF" || return 1
+    chmod 644 "$UNATTENDED_CONF"
+    if [ -n "$HAS_SYSTEMD" ]; then
+        systemctl enable --now unattended-upgrades >/dev/null 2>&1 \
+            || warn "No se pudo activar el servicio unattended-upgrades; revísalo."
+    fi
+    if [ "$AUTO_REBOOT" = no ]; then
+        state_set updates 'solo seguridad, sin reinicio automático'
+    else
+        state_set updates "solo seguridad, reinicio automático a las $AUTO_REBOOT si hace falta"
+    fi
+    return 0
+}
+run_step updates "Parches automáticos de seguridad" do_updates
+
 # --- Cuenta de rescate ----------------------------------------------------
 # Va la última a propósito: mientras algo pueda fallar, la cuenta 'installer'
 # es la única vía de entrada garantizada, que es justo para lo que existe.
@@ -2002,6 +2167,12 @@ write_summaries() {
         printf '\nVERSIONES\n'
         version_table
         printf '  Tambien en %s (0644)\n' "$VERSION_FILE"
+        printf '\nMANTENIMIENTO\n'
+        printf '  Logs de Docker .... %s\n' "$(state_get docker_logs 'sin configurar')"
+        printf '  Actualizaciones ... %s\n' "$(state_get updates 'sin configurar')"
+        printf '  Copias y monitorización: NO configuradas. Este equipo no tiene\n'
+        printf '  copia de /data/coolify ni aviso si el túnel se cae; montarlo es\n'
+        printf '  cosa tuya antes de darle uso serio.\n'
         printf '\nESTADO DE SERVICIOS\n'
         printf '  docker ............ %s\n' "$(svc_state docker)"
         printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"

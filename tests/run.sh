@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer registro descargas version resolution tunnel build latecommands
+# Grupos: syntax json validators timezone secrets installer registro mantenimiento descargas version resolution tunnel build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
@@ -48,7 +48,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer registro descargas version resolution tunnel build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer registro mantenimiento descargas version resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -637,6 +637,171 @@ case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
     *--skip-coolify-register*) ok "--skip-coolify-register aparece en la ayuda" ;;
     *) bad "--skip-coolify-register aparece en la ayuda" ;;
 esac
+fi
+
+# ----------------------------------------------------------- mantenimiento
+if want mantenimiento; then
+group "Mantenimiento: logs de Docker y parches de seguridad (#11)"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^valid_auto_reboot() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^docker_daemon_json() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^unattended_conf() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_docker_config() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_updates() {/,/^}/p' "$ROOT/setup.sh")"
+note() { :; }
+warn() { :; }
+err()  { :; }
+info() { :; }
+need_root() { return 0; }
+
+MNT="$TMP/mnt"; mkdir -p "$MNT"
+STATE_DIR="$MNT/state"; mkdir -p "$STATE_DIR"
+
+# --- daemon.json ----------------------------------------------------------
+if have python3; then
+    if docker_daemon_json | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+        ok "daemon.json es JSON valido"
+    else
+        bad "daemon.json es JSON valido" "$(docker_daemon_json)"
+    fi
+    v=$(docker_daemon_json | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(d["log-driver"], d["log-opts"]["max-size"], d["log-opts"]["max-file"])' 2>/dev/null || echo ERROR)
+    is "con json-file, 10m y 3 ficheros" "json-file 10m 3" "$v"
+else
+    skip "daemon.json es JSON valido" "hace falta python3"
+fi
+
+# --- do_docker_config -----------------------------------------------------
+# Se ejecuta en subshell con 'ok' y 'have' anuladas: 'ok' aqui es el contador
+# de pruebas, y 'have docker' dispararia un 'docker info' de verdad. El estado
+# viaja por disco, asi que el subshell no estorba.
+dcfg() { ( ok() { :; }; have() { return 1; }; do_docker_config ) >/dev/null 2>&1; }
+# Consumidas por do_docker_config, cargada con eval: el analizador no lo ve.
+# shellcheck disable=SC2034
+SKIP_DOCKER=''
+# shellcheck disable=SC2034
+HAS_SYSTEMD=''
+DOCKER_DAEMON_JSON="$MNT/etc/docker/daemon.json"
+
+rm -f "$STATE_DIR/state.docker_logs"
+st=0; dcfg || st=$?
+is "escribe daemon.json si no habia" "0" "$st"
+if [ -f "$DOCKER_DAEMON_JSON" ]; then ok "el fichero queda escrito"; else bad "el fichero queda escrito"; fi
+case "$(state_get docker_logs)" in
+    *'max-size 10m'*) ok "y el resumen lo puede contar" ;;
+    *) bad "y el resumen lo puede contar" "[$(state_get docker_logs)]" ;;
+esac
+
+# Idempotente: el mismo fichero otra vez no es "ya habia uno ajeno".
+dcfg
+case "$(state_get docker_logs)" in
+    *'max-size 10m'*) ok "reejecutar sobre el nuestro no lo da por ajeno" ;;
+    *) bad "reejecutar sobre el nuestro no lo da por ajeno" "[$(state_get docker_logs)]" ;;
+esac
+
+# Un daemon.json ajeno NO se fusiona a ciegas: se avisa y se deja intacto.
+printf '{ "insecure-registries": ["10.0.0.1:5000"] }\n' > "$DOCKER_DAEMON_JSON"
+antes=$(cat "$DOCKER_DAEMON_JSON")
+dcfg
+is "un daemon.json ajeno se deja intacto" "$antes" "$(cat "$DOCKER_DAEMON_JSON")"
+case "$(state_get docker_logs)" in
+    *'SIN TOCAR'*) ok "y el resumen dice que hay que hacerlo a mano" ;;
+    *) bad "y el resumen dice que hay que hacerlo a mano" "[$(state_get docker_logs)]" ;;
+esac
+
+# --- politica de reinicio -------------------------------------------------
+chk_reboot() { # chk_reboot valor esperado(0|1)
+    if valid_auto_reboot "$1"; then got=0; else got=1; fi
+    if [ "$got" = "$2" ]; then ok "--auto-reboot=$1 $([ "$2" = 0 ] && echo vale || echo 'no vale')"
+    else bad "--auto-reboot=$1" "esperaba rc=$2"; fi
+}
+chk_reboot no    0
+chk_reboot 03:30 0
+chk_reboot 00:00 0
+chk_reboot 23:59 0
+chk_reboot 24:00 1
+chk_reboot 3:30  1
+chk_reboot si    1
+chk_reboot ''    1
+
+# --- unattended_conf ------------------------------------------------------
+CONF_NO=$(unattended_conf no)
+CONF_HR=$(unattended_conf 03:30)
+case "$CONF_NO" in
+    *'Automatic-Reboot "false"'*) ok "por defecto no reinicia solo" ;;
+    *) bad "por defecto no reinicia solo" ;;
+esac
+case "$CONF_NO" in
+    *Automatic-Reboot-Time*) bad "sin hora de reinicio cuando es 'no'" ;;
+    *) ok "sin hora de reinicio cuando es 'no'" ;;
+esac
+case "$CONF_HR" in
+    *'Automatic-Reboot "true"'*'Automatic-Reboot-Time "03:30"'*) ok "con hora, reinicia a esa hora" ;;
+    *) bad "con hora, reinicia a esa hora" "$CONF_HR" ;;
+esac
+# Solo seguridad: ni -updates ni -backports pueden colarse.
+case "$CONF_NO" in
+    *-updates*|*-backports*|*-proposed*) bad "solo entran origenes de seguridad" "$CONF_NO" ;;
+    *) ok "solo entran origenes de seguridad" ;;
+esac
+case "$CONF_NO" in
+    *'#clear Unattended-Upgrade::Allowed-Origins;'*) ok "vacia la lista antes, no la amplia" ;;
+    *) bad "vacia la lista antes, no la amplia" ;;
+esac
+case "$CONF_NO" in
+    *'APT::Periodic::Unattended-Upgrade "1";'*) ok "y el temporizador queda activado" ;;
+    *) bad "y el temporizador queda activado" ;;
+esac
+
+# --no-unattended-upgrades no toca nada.
+UNATTENDED_CONF="$MNT/etc/apt/apt.conf.d/51coolify-unattended"
+# shellcheck disable=SC2034
+AUTO_REBOOT=no
+NO_UNATTENDED=1
+( ok() { :; }; do_updates ) >/dev/null 2>&1
+if [ -e "$UNATTENDED_CONF" ]; then bad "--no-unattended-upgrades no escribe nada"
+else ok "--no-unattended-upgrades no escribe nada"; fi
+is "y lo dice en el resumen" "omitido (--no-unattended-upgrades)" "$(state_get updates)"
+# shellcheck disable=SC2034
+NO_UNATTENDED=''
+
+# --- orden de los pasos ---------------------------------------------------
+# apt-get es lo unico de todo el script que puede pelearse por el lock de dpkg:
+# tiene que quedar DESPUES de que Docker y Coolify hayan terminado con el.
+l_docker=$(grep -n '^run_step docker "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_dcfg=$(grep -n '^run_step docker_config ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_coolify=$(grep -n '^run_step coolify "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_tsvc=$(grep -n '^run_step tunnel_service ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_upd=$(grep -n '^run_step updates ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ "$l_docker" -lt "$l_dcfg" ] && [ "$l_dcfg" -lt "$l_coolify" ]; then
+    ok "daemon.json se escribe entre Docker y Coolify"
+else
+    bad "daemon.json se escribe entre Docker y Coolify" \
+        "docker=$l_docker docker_config=$l_dcfg coolify=$l_coolify"
+fi
+if [ "$l_tsvc" -lt "$l_upd" ]; then
+    ok "los parches van despues del tunel, no antes"
+else
+    bad "los parches van despues del tunel, no antes" "tunnel_service=$l_tsvc updates=$l_upd"
+fi
+malo=''
+for n in $(grep -n 'apt-get' "$ROOT/setup.sh" | cut -d: -f1); do
+    [ "$n" -gt "$l_tsvc" ] || malo="$malo $n"
+done
+if [ -z "$malo" ]; then
+    ok "ningun apt-get antes de que Docker y Coolify suelten el lock de dpkg"
+else
+    bad "ningun apt-get antes de que Docker y Coolify suelten el lock de dpkg" "lineas:$malo"
+fi
+
+for f in --auto-reboot --no-unattended-upgrades; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
 fi
 
 # --------------------------------------------------------------- descargas
@@ -1299,9 +1464,9 @@ PYEOF
     run_hasta_tunel() { # run_hasta_tunel DIRESTADO ARGS...
         _sd=$1; shift
         mkdir -p "$_sd/coolify-setup"
-        for _st in wifi hostname timezone admin_user docker coolify \
-                   coolify_domain coolify_register cloudflared_bin \
-                   tunnel_service retire_installer; do
+        for _st in wifi hostname timezone admin_user docker docker_config \
+                   coolify coolify_domain coolify_register cloudflared_bin \
+                   tunnel_service updates retire_installer; do
             : > "$_sd/coolify-setup/step.$_st"
         done
         env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$_sd" \

@@ -471,7 +471,7 @@ detalle, las implicaciones y un esbozo de solución.
 | | Qué pasa |
 |---|---|
 | [#7](https://github.com/fompi/autounattended-coolify/issues/7) | El registro del primer usuario de Coolify **raspa su HTML**: se romperá en alguna actualización de Coolify. Lo que ya no hace es mentir — el éxito se comprueba releyendo `/register`, no por el código HTTP— y el resumen distingue registrado, ya existía, pendiente y omitido (`--skip-coolify-register`). |
-| [#11](https://github.com/fompi/autounattended-coolify/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
+| [#11](https://github.com/fompi/autounattended-coolify/issues/11) | **Sin copias y sin monitorización.** No hay copia de `/data/coolify` ni aviso si el túnel se cae. Lo que sí está resuelto es el fallo más probable —los logs de los contenedores llenando el disco, ahora limitados en `/etc/docker/daemon.json`— y los parches de seguridad automáticos (`--auto-reboot`, `--no-unattended-upgrades`). |
 | [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Quedan pendientes las etiquetas semánticas, el workflow de release y el aviso en CI cuando se toca el código sin tocar el `CHANGELOG.md`. La trazabilidad básica ya está: ver «Versiones» más abajo. |
 | [#14](https://github.com/fompi/autounattended-coolify/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
 | [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |

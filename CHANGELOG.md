@@ -41,6 +41,24 @@ Versionado [semántico](https://semver.org/lang/es/).
   `--pin-cloudflared` y `--offline-dir`. `SECURITY.md` explica qué es
   verificación de verdad y qué no.
 
+### Añadido
+- **Los logs de los contenedores dejan de crecer sin tope** ([#11], parte). Paso
+  nuevo `docker_config`, entre Docker y Coolify: escribe `/etc/docker/daemon.json`
+  con `json-file`, `max-size 10m` y `max-file 3`, y reinicia `dockerd` —que es
+  lo único que hace que ese fichero surta efecto—. Si ya había un `daemon.json`
+  con contenido no se fusiona a ciegas: se avisa, se deja intacto y el resumen
+  dice qué añadir a mano. Va antes de Coolify a propósito: reiniciar `dockerd`
+  con Coolify en marcha es tirarle los contenedores encima.
+- **Parches automáticos de seguridad** ([#11], parte). Paso nuevo `updates`,
+  el último de todos, con `unattended-upgrades` limitado a los orígenes de
+  seguridad (`#clear` de la lista heredada incluido, que si no se suma en vez
+  de sustituir). `--auto-reboot=no|HH:MM`, por defecto `no`, y
+  `--no-unattended-upgrades` para desactivarlo. Va al final porque es la única
+  llamada a `apt-get` de todo el script y competir por el lock de `dpkg` con el
+  instalador de Docker o el de Coolify no falla limpio: cuelga las dos cosas.
+  Copias, monitorización y procedimiento de recuperación siguen pendientes, y
+  el resumen lo dice en vez de callárselo.
+
 ### Cambiado
 - **Versionado real** ([#13]). `build-usb.sh` hornea `git describe --tags
   --always --dirty` en el `user-data`, y llega al destino por el
@@ -120,6 +138,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#7]: https://github.com/fompi/autounattended-coolify/issues/7
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
+[#11]: https://github.com/fompi/autounattended-coolify/issues/11
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15
 [#1]: https://github.com/fompi/culificador/issues/1
