@@ -33,6 +33,28 @@ de root. Conviene tener claro qué protege y qué no.
 - **Credenciales en el resumen.** `/root/instalacion-resumen.txt` guarda en
   claro las contraseñas generadas, con modo 0600 y sin caducidad.
 
+## Llamadas salientes
+
+Todo lo que `setup.sh` habla con el exterior, y cuándo. No hay ninguna otra.
+
+| Destino | Cuándo | Qué revela |
+|---|---|---|
+| `api.cloudflare.com` | siempre (salvo `--skip-tunnel`, que aún así verifica el token) | el token, el dominio y la IP pública |
+| `cloudflare.com/cdn-cgi/trace` | solo si no se detecta ruta por defecto con las herramientas del sistema | la IP pública |
+| `ipapi.co/timezone` | **condicional**: solo si el sistema no tiene zona horaria propia (está en UTC), no se pasó `--timezone` y no se pasó `--no-geoip`/`NO_GEOIP=1` | la IP pública y el momento de la instalación |
+| `get.docker.com` | salvo `--skip-docker`, y solo si Docker no está ya instalado | la IP pública |
+| `cdn.coollabs.io/coolify/install.sh` | salvo `--skip-coolify`, y solo si `/data/coolify` no existe | la IP pública |
+| `github.com/cloudflare/cloudflared/releases/...` | salvo `--skip-tunnel`, y solo si `cloudflared` no está ya instalado | la IP pública |
+| `github.com/jqlang/jq/releases/...` | solo si no hay `jq` **ni** Python en el sistema | la IP pública |
+| `http://localhost:8000` | salvo `--skip-coolify` | nada: es local |
+
+La llamada a `ipapi.co` se anuncia por pantalla antes de hacerse. Es la única
+que existe solo para adivinar un dato y la única que se puede desactivar sin
+perder funcionalidad: sin ella el equipo se queda en UTC, que en un servidor es
+una elección perfectamente defendible.
+
+Ninguna descarga se verifica contra un hash o una firma (ver más arriba).
+
 ## Manejo de secretos
 
 - Prefiere `--cf-token=@fichero` o la variable `CF_API_TOKEN`. Un

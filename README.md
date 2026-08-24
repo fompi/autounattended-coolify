@@ -43,7 +43,7 @@ formulario. Ver [Qué está verificado y qué no](#qué-está-verificado-y-qué-
 | Usuario administrador | `SUDO_USER`, o el primer usuario con uid ≥ 1000, o se crea `admin`. |
 | Contraseña del admin | Generada (24 caracteres). Aparece en el resumen final. |
 | Clave SSH | Se respeta la que ya haya en `authorized_keys`; si se pasa `--ssh-key`, se desactiva el acceso por contraseña. |
-| Zona horaria | Geolocalización de la IP pública; si falla, la del sistema; si no, UTC. |
+| Zona horaria | La del sistema; si el sistema está en UTC, geolocalización de la IP pública (evitable con `--no-geoip`); si falla, UTC. |
 | Email del admin de Coolify | Extraído del nombre de la cuenta de Cloudflare; si no, `admin@<dominio>`. |
 | Contraseña de Coolify | Generada. Aparece en el resumen final. |
 | Tunnel ID, rutas DNS, tokens internos | Creados vía API. |
@@ -308,9 +308,12 @@ Sin ella, la única vía es el modo de recuperación de GRUB (mantén
   HTML de Coolify; si falla, no rompe nada — el resumen final te dice que entres
   al panel y te registres con el email y la contraseña que ya tienes ahí. El
   primer usuario registrado es el propietario.
-- **Geolocalización.** Para deducir la zona horaria se consulta `ipapi.co`, lo
-  que revela tu IP pública a ese servicio. Con `--timezone=Europe/Madrid` no se
-  hace ninguna llamada.
+- **Geolocalización.** La zona horaria se toma del sistema. Solo si el sistema
+  está en UTC —o sea, si nadie ha elegido ninguna— se consulta `ipapi.co`, y se
+  avisa por pantalla antes de hacerlo: esa llamada revela tu IP pública y el
+  momento de la instalación. Con `--timezone=Europe/Madrid` o con `--no-geoip`
+  (o `NO_GEOIP=1`) no se hace nunca. `SECURITY.md` enumera todas las llamadas
+  salientes del script.
 - **Secretos en `ps`.** Un `--cf-token=xxx` literal es visible para otros
   usuarios de la máquina. Usa `@fichero`, `@-` o la variable de entorno.
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
@@ -330,7 +333,6 @@ detalle, las implicaciones y un esbozo de solución.
 | [#4](https://github.com/fompi/culificador/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
 | [#8](https://github.com/fompi/culificador/issues/8) | `build-usb.sh` no verifica la ISO de entrada. |
 | [#9](https://github.com/fompi/culificador/issues/9) | La cuenta `installer` sobrevive; con `--rescue-password`, con contraseña permanente. |
-| [#12](https://github.com/fompi/culificador/issues/12) | La geolocalización de la IP se hace por defecto y sin avisar. |
 
 ### Sin verificar
 
