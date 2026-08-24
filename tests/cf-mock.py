@@ -6,9 +6,22 @@ de zonas, cuentas, tuneles (crear, token, configuracion de ingress) y registros
 DNS. Guarda el estado en memoria y lo expone en /__state para que las pruebas
 puedan comprobar QUE se creo, no solo que la llamada devolvio 200.
 
-  cf-mock.py PUERTO [--zones N]
+  cf-mock.py PUERTO [--zones N] [--tunnel-status MODO]
 
 El token valido es GOODTOKEN; cualquier otro devuelve 401 como el real.
+
+--tunnel-status controla lo que responde GET /accounts/{a}/cfd_tunnel/{id},
+que es como setup.sh comprueba que el tunel esta CONECTADO de verdad (#6):
+
+  healthy      (por defecto) conectado
+  degraded     conectado, con menos conexiones al edge de las esperadas
+  inactive     nunca conecta: sirve para probar que el paso falla con tiempo
+               maximo corto en vez de dar un falso positivo
+  flaky:N      'inactive' las primeras N consultas y 'healthy' despues: sirve
+               para probar que hay reintentos de verdad y no un unico sondeo
+               con suerte
+
+El numero de consultas de estado se expone en /__state como status_queries.
 """
 import base64
 import json
@@ -21,6 +34,9 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
 NZONES = 1
 if "--zones" in sys.argv:
     NZONES = int(sys.argv[sys.argv.index("--zones") + 1])
+TUNNEL_STATUS = "healthy"
+if "--tunnel-status" in sys.argv:
+    TUNNEL_STATUS = sys.argv[sys.argv.index("--tunnel-status") + 1]
 
 ACCOUNT = {"id": "acct-1", "name": "ferran.fompi@gmail.com's Account"}
 ALL_ZONES = [
@@ -29,7 +45,16 @@ ALL_ZONES = [
     {"id": "zone-ccc", "name": "tercero.org", "status": "pending", "account": ACCOUNT},
 ]
 ZONES = ALL_ZONES[:NZONES]
-STATE = {"tunnels": {}, "dns": {}, "ingress": None, "log": []}
+STATE = {"tunnels": {}, "dns": {}, "ingress": None, "log": [], "status_queries": 0}
+
+
+def tunnel_status():
+    """Estado del tunel, contando las consultas para poder comprobar reintentos."""
+    STATE["status_queries"] += 1
+    if TUNNEL_STATUS.startswith("flaky:"):
+        fallos = int(TUNNEL_STATUS.split(":", 1)[1])
+        return "inactive" if STATE["status_queries"] <= fallos else "healthy"
+    return TUNNEL_STATUS
 
 
 def tunnel_token(account_id, tunnel_id):
@@ -85,6 +110,18 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/accounts/([^/]+)/cfd_tunnel/([^/]+)/token$", path)
         if m:
             return self._ok(tunnel_token(m.group(1), m.group(2)))
+
+        # Ojo con el orden: esta ruta tiene que ir despues de /token y de
+        # /configurations (que tambien empiezan por el id) y antes del prefijo
+        # generico de cfd_tunnel, o no se alcanzaria nunca.
+        m = re.match(r"^/accounts/([^/]+)/cfd_tunnel/([^/?]+)$", path)
+        if m and method == "GET":
+            tid = m.group(2)
+            if tid not in STATE["tunnels"]:
+                return self._send({"success": False, "result": None, "errors": [
+                    {"code": 1003, "message": "tunnel not found"}]}, 404)
+            return self._ok({"id": tid, "name": STATE["tunnels"][tid],
+                             "status": tunnel_status()})
 
         m = re.match(r"^/accounts/([^/]+)/cfd_tunnel", path)
         if m:
