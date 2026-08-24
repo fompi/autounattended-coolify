@@ -6,7 +6,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 ## [No publicado]
 
 ### Añadido
-- Suite de pruebas (`tests/run.sh`) con 146 comprobaciones y un simulador de la
+- Suite de pruebas (`tests/run.sh`) con 208 comprobaciones y un simulador de la
   API de Cloudflare.
 - Integración continua: shellcheck en dialecto `sh`, sintaxis en cinco shells,
   la suite completa y comprobaciones de que no se filtran secretos.
@@ -29,6 +29,32 @@ Versionado [semántico](https://semver.org/lang/es/).
   `--keep-rescue`, `--purge-installer` e `--installer-user`. El paso nunca
   aborta la instalación y el resumen dice siempre cómo quedó la cuenta.
 
+### Seguridad
+- **Las descargas se verifican contra un SHA-256** ([#2]). `jq` contra el hash
+  que publica su release; `cloudflared` contra uno calculado por nosotros —que
+  es confianza en el primer uso, no verificación independiente: Cloudflare no
+  publica hashes—. Un hash que no cuadra aborta el paso y borra el fichero; si
+  no hay `sha256sum`, `shasum` ni `openssl`, falla en vez de continuar a
+  ciegas. Docker y Coolify no tienen artefacto verificable: nuevas
+  `--pin-docker` y `--pin-coolify`, y sin pin se avisa por pantalla y en el log
+  de que se ejecuta un script remoto como root sin verificar. Nuevas también
+  `--pin-cloudflared` y `--offline-dir`. `SECURITY.md` explica qué es
+  verificación de verdad y qué no.
+
+### Cambiado
+- **Versionado real** ([#13]). `build-usb.sh` hornea `git describe --tags
+  --always --dirty` en el `user-data`, y llega al destino por el
+  `EnvironmentFile` de la unidad systemd (`SETUP_VERSION=`), no por un marcador
+  dentro de `setup.sh`: el script incrustado tiene que seguir siendo idéntico
+  byte a byte al original. Nuevo `--version` en **ambos** scripts, tabla de
+  versiones en el resumen final y `/etc/coolify-setup.version` (0644, sin
+  secretos). El `EnvironmentFile` se genera ahora en un solo sitio, del que
+  beben tanto el bloque `write_files` como el `/cidata` de la ISO.
+- **`cloudflared` se instala en una versión fija** ([#5]), no desde
+  `releases/latest`: la misma ISO tiene que dar el mismo sistema. Nueva
+  `--cloudflared-version=X`, que sobrevive al reintento. La URL de `jq` pasa a
+  componerse con la misma constante de versión.
+
 ### Corregido
 - **Reejecutar dejaba túneles huérfanos en Cloudflare** ([#15]). El nombre del
   túnel era `coolify-$HOSTNAME`, así que reinstalar el equipo con otro hostname
@@ -48,6 +74,9 @@ Versionado [semántico](https://semver.org/lang/es/).
   —sin salida a internet, puerto 7844 bloqueado, token del túnel inválido—, que
   tienen tres soluciones distintas. Y un `cloudflared` ya activo solo se da por
   bueno si lleva el token de *este* túnel, no el de un intento anterior.
+- `do_cloudflared_bin` no tenía guarda de sistema operativo: en macOS componía
+  `cloudflared-darwin-amd64`, que no existe como asset, y moría con un 404
+  opaco. Ahora lo dice y apunta a `brew install cloudflared`.
 - El bloque `late-commands` usaba `install -D`, que es una extensión de GNU.
   Ahora `mkdir -p` + `cp` + `chmod`, para poder ejecutarlo y comprobarlo en
   cualquier POSIX.
@@ -73,8 +102,17 @@ Versionado [semántico](https://semver.org/lang/es/).
 - Plantilla de autoinstall y `build-usb.sh`.
 
 [#1]: https://github.com/fompi/autounattended-coolify/issues/1
+[#2]: https://github.com/fompi/autounattended-coolify/issues/2
 [#3]: https://github.com/fompi/autounattended-coolify/issues/3
+[#5]: https://github.com/fompi/autounattended-coolify/issues/5
 [#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15
+[#1]: https://github.com/fompi/culificador/issues/1
+[#2]: https://github.com/fompi/culificador/issues/2
+[#3]: https://github.com/fompi/culificador/issues/3
+[#5]: https://github.com/fompi/culificador/issues/5
+[#9]: https://github.com/fompi/culificador/issues/9
+[#12]: https://github.com/fompi/culificador/issues/12
+[#13]: https://github.com/fompi/culificador/issues/13

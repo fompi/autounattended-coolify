@@ -18,14 +18,18 @@ de root. Conviene tener claro qué protege y qué no.
 
 - La máquina donde corres `build-usb.sh`.
 - El USB físico entre que lo grabas y arrancas el mini PC.
-- La red desde la que se descargan Docker, Coolify, cloudflared y `jq`.
-- Los proveedores de esos artefactos (Docker, Coollabs, Cloudflare, jq).
+- Los proveedores de los artefactos (Docker, Coollabs, Cloudflare, jq).
+- Para Docker y Coolify, además, la red: su script se descarga y se ejecuta sin
+  verificar salvo que lo fijes tú (ver abajo).
 
 **Lo que no protege hoy:**
 
-- **Integridad de las descargas.** Ninguna descarga se verifica contra un hash
-  o una firma. Un compromiso de esos orígenes, o un intermediario capaz de
-  romper TLS, ejecuta código como root. Seguimiento en las incidencias.
+- **Integridad de las descargas: parcial, y el reparto no es uniforme.** Ver
+  «Verificación de las descargas» más abajo. En resumen: `jq` se verifica
+  contra el hash que publica su autor; `cloudflared` contra un hash que
+  calculamos nosotros una vez —que es confianza en el primer uso, no
+  verificación independiente—; y el script de Docker y el de Coolify **no se
+  verifican** salvo que pases `--pin-docker` / `--pin-coolify`.
 - **El token en el medio.** Con `--cf-token`, el token de Cloudflare viaja **en
   claro** dentro del `user-data` de la ISO. Quien tenga el USB lo tiene.
 - **Los secretos mientras dura la instalación.** Hasta que termina con éxito,
@@ -33,6 +37,10 @@ de root. Conviene tener claro qué protege y qué no.
   `/var/lib/coolify-setup/config.env`, y el del túnel en
   `tunnel.env`, todos en modo 0600. Tienen que seguir ahí: son de donde sale el
   reintento si algo falla a mitad.
+- **`/etc/coolify-setup.version`.** Se escribe en 0644 a propósito: dice qué
+  versión del proyecto y de cada componente instaló el equipo, y no lleva
+  ningún secreto. Cualquier usuario local puede leerlo — es información de
+  inventario, no de acceso.
 - **Credenciales tras la instalación.** Las contraseñas generadas quedan en
   claro en `/root/instalacion-credenciales.txt` (modo 0600, propiedad de root)
   y sin caducidad. Es un compromiso deliberado: sin ellas el equipo queda
@@ -87,7 +95,54 @@ que existe solo para adivinar un dato y la única que se puede desactivar sin
 perder funcionalidad: sin ella el equipo se queda en UTC, que en un servidor es
 una elección perfectamente defendible.
 
-Ninguna descarga se verifica contra un hash o una firma (ver más arriba).
+## Verificación de las descargas
+
+Lo que se verifica, y con qué honestidad. La diferencia entre los tres casos
+importa más que el hecho de que haya verificación:
+
+| Artefacto | Qué se comprueba | De dónde sale el hash |
+|---|---|---|
+| `jq` | SHA-256 contra la tabla de `setup.sh` | del `sha256sum.txt` que publica la propia release de `jqlang/jq`. Es verificación contra lo que dice el autor. |
+| `cloudflared` | SHA-256 contra la tabla de `setup.sh` | **calculado por nosotros** descargando el binario una vez (2026-08-24). Cloudflare **no publica hashes** de sus releases. |
+| `get-docker.sh` | nada, salvo `--pin-docker=SHA256` | no existe hash por versión. |
+| `install.sh` de Coolify | nada, salvo `--pin-coolify=SHA256` | no existe hash por versión. |
+
+**Lo de `cloudflared` es confianza en el primer uso, no verificación.** El hash
+de la tabla dice «esto es lo mismo que había el día que lo miramos», no «esto
+es lo que Cloudflare firma». Si el binario de aquel día ya estuviera
+comprometido, el hash lo perpetuaría sin que nadie se enterase. Detecta cambios
+posteriores; no sustituye a una firma que Cloudflare no ofrece.
+
+Reglas del mecanismo:
+
+- El hash se comprueba con `sha256sum`, `shasum -a 256` u `openssl dgst
+  -sha256`, en ese orden. Si **no hay ninguna**, el paso falla: no se continúa
+  sin poder verificar.
+- Un hash que no cuadra aborta el paso **y borra el fichero**. No queda ningún
+  binario ni script sin verificar en el disco.
+- La tabla vive dentro de `setup.sh` porque el script viaja solo (`curl | sh`, o
+  incrustado en el `user-data`) y no tiene el repositorio al lado.
+- `--pin-cloudflared=SHA256` manda sobre la tabla: sirve para instalar con
+  `--cloudflared-version=X` una versión que este script no conoce, sin
+  renunciar a verificar. Sin pin y sin entrada en la tabla, el paso falla.
+
+Para fijar Docker o Coolify, calcula el hash una vez desde una máquina y una red
+en las que confíes:
+
+```bash
+curl -fsSL https://get.docker.com | sha256sum
+curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sha256sum
+```
+
+y pásalos con `--pin-docker=` y `--pin-coolify=`. **Envejecen**: ambos scripts
+cambian sin previo aviso, y cuando cambien la instalación fallará hasta que
+actualices el pin. Sin pin no se bloquea nada, pero se avisa por pantalla y en
+el log de que se va a ejecutar como root un script remoto sin verificar.
+
+`--offline-dir=RUTA` coge los cuatro artefactos de un directorio local en vez de
+la red, con estos nombres exactos: `get-docker.sh`, `install-coolify.sh`,
+`cloudflared-linux-ARCH` y `jq-linux-ARCH`. Lo que venga de ahí **se verifica
+igual**: un directorio local no es una fuente de confianza por ser local.
 
 ## La cuenta de rescate
 

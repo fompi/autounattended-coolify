@@ -32,6 +32,19 @@ RESCUE_PW=''
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'AVISO: %s\n' "$*" >&2; }
 
+# Revision de git con la que se construye. Se hornea en el user-data para poder
+# responder despues a "que version instalo este equipo". Construir fuera de un
+# repositorio tambien es informacion, asi que se deja constancia.
+project_version() {
+    if command -v git >/dev/null 2>&1 \
+       && git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        _v=$(git -C "$HERE" describe --tags --always --dirty 2>/dev/null) || _v=''
+        [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+    fi
+    printf 'sin-git'
+}
+BUILD_VERSION=$(project_version)
+
 argval() {
     case "$1" in
         @-) cat ;;
@@ -89,6 +102,7 @@ OPCIONES
                       --ssh-key tiene su propia opcion. Si necesitas pasar una
                       contrasena con espacios, usa la forma @fichero de
                       setup.sh apuntando a un fichero del sistema destino.
+  --version           Imprime la revision de git que se horneara y sale.
   -h, --help          Esta ayuda.
 EOF
 }
@@ -114,6 +128,7 @@ while [ $# -gt 0 ]; do
         --out=*)      OUT=${1#*=} ;;
         --out)        shift; OUT=$1 ;;
         --)           shift; PASSTHRU="$*"; break ;;
+        --version)    printf 'build-usb.sh %s\n' "$BUILD_VERSION"; exit 0 ;;
         -h|--help)    usage; exit 0 ;;
         *)            usage >&2; die "Opcion desconocida: $1" ;;
     esac
@@ -173,27 +188,35 @@ if [ -n "$SSH_KEY" ]; then
     PASSTHRU="$PASSTHRU --ssh-key=@/etc/coolify-setup.pub"
 fi
 
-if [ -n "$CF_TOKEN" ] || [ -n "$PASSTHRU" ]; then
-    {
+# Las lineas del EnvironmentFile de la unidad systemd, en UN SOLO SITIO.
+# Antes se generaban en dos -el bloque write_files de aqui abajo y el /cidata
+# que va dentro de la ISO- y tocar solo uno dejaba sin datos justo el camino
+# que de verdad funciona en el destino: el de late-commands.
+env_lines() {
+    if [ -n "$CF_TOKEN" ]; then printf 'CF_API_TOKEN=%s\n' "$CF_TOKEN"; fi
+    if [ -n "$PASSTHRU" ]; then printf 'SETUP_EXTRA_ARGS=%s\n' "$PASSTHRU"; fi
+    # Siempre, haya token o no: es lo unico que permite saber despues con que
+    # version se instalo el equipo.
+    printf 'SETUP_VERSION=%s\n' "$BUILD_VERSION"
+}
+
+{
+    printf '\n'
+    printf "      - path: /etc/coolify-setup.env\n"
+    printf "        owner: root:root\n"
+    printf "        permissions: '0600'\n"
+    printf "        content: |\n"
+    # 10 espacios: el escalar literal de YAML donde va incrustado.
+    env_lines | sed 's/^/          /'
+    if [ -n "$SSH_KEY" ]; then
         printf '\n'
-        printf "      - path: /etc/coolify-setup.env\n"
+        printf "      - path: /etc/coolify-setup.pub\n"
         printf "        owner: root:root\n"
-        printf "        permissions: '0600'\n"
+        printf "        permissions: '0644'\n"
         printf "        content: |\n"
-        [ -n "$CF_TOKEN" ] && printf "          CF_API_TOKEN=%s\n" "$CF_TOKEN"
-        [ -n "$PASSTHRU" ] && printf "          SETUP_EXTRA_ARGS=%s\n" "$PASSTHRU"
-        if [ -n "$SSH_KEY" ]; then
-            printf '\n'
-            printf "      - path: /etc/coolify-setup.pub\n"
-            printf "        owner: root:root\n"
-            printf "        permissions: '0644'\n"
-            printf "        content: |\n"
-            printf "          %s\n" "$SSH_KEY"
-        fi
-    } > "$TMP/envblock"
-else
-    : > "$TMP/envblock"
-fi
+        printf "          %s\n" "$SSH_KEY"
+    fi
+} > "$TMP/envblock"
 
 # --- Ensamblado --------------------------------------------------------------
 # El script se indenta 10 espacios para caber en el escalar literal de YAML.
@@ -236,7 +259,11 @@ original = open(src).read()
 if files["/usr/local/sbin/coolify-setup.sh"].rstrip("\n") != original.rstrip("\n"):
     sys.exit("el script incrustado NO coincide con setup.sh")
 print("  YAML valido; setup.sh incrustado identico al original")
-if "/etc/coolify-setup.env" in files:
+env = files.get("/etc/coolify-setup.env", "")
+ver = [l for l in env.splitlines() if l.startswith("SETUP_VERSION=")]
+assert ver, "el user-data no hornea SETUP_VERSION"
+print("  version horneada: " + ver[0].split("=", 1)[1])
+if "CF_API_TOKEN=" in env:
     print("  token horneado: el mini PC no preguntara nada")
 PYEOF
 else
@@ -566,13 +593,12 @@ if [ -n "$ISO_IN" ]; then
     cp "$OUT/user-data" "$OUT/meta-data" "$TMP/cidata/"
     install -m 0755 "$SETUP" "$TMP/cidata/coolify-setup.sh"
     install -m 0644 "$UNIT"  "$TMP/cidata/coolify-setup.service"
-    if [ -n "$CF_TOKEN" ] || [ -n "$PASSTHRU" ]; then
-        umask 077
-        : > "$TMP/cidata/coolify-setup.env"
-        [ -n "$CF_TOKEN" ] && printf 'CF_API_TOKEN=%s\n' "$CF_TOKEN" >> "$TMP/cidata/coolify-setup.env"
-        [ -n "$PASSTHRU" ] && printf 'SETUP_EXTRA_ARGS=%s\n' "$PASSTHRU" >> "$TMP/cidata/coolify-setup.env"
-        umask 022
-    fi
+    # El MISMO env_lines que el bloque write_files. Si aqui se generase aparte,
+    # cualquier cosa que se anadiese alli no llegaria por este camino, que es
+    # el principal.
+    umask 077
+    env_lines > "$TMP/cidata/coolify-setup.env"
+    umask 022
     [ -n "$SSH_KEY" ] && printf '%s\n' "$SSH_KEY" > "$TMP/cidata/coolify-setup.pub"
 
     # El grub.cfg ya lo extrajo iso_sanity, antes de tocar nada.

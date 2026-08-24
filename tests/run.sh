@@ -7,8 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer resolution tunnel
-#         build latecommands
+# Grupos: syntax json validators timezone secrets installer descargas version resolution tunnel build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
@@ -49,7 +48,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer resolution tunnel build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer descargas version resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -232,6 +231,8 @@ fi
 if want secrets; then
 group "Secretos: borrado, resumen partido y orden de #3"
 eval "$(sed -n '/^wipe_file() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^comp_version() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^version_table() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^wipe_secrets() {/,/^}/p' "$ROOT/setup.sh")"
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -277,6 +278,12 @@ fake_config() {
     LOG_FILE="$SEC/log"
     IS_ROOT=''
     KEEP_SECRETS=''
+    VERSION='1.0-prueba'
+    VERSION_SOURCE='horneada al construir'
+    CLOUDFLARED_VERSION='2026.8.2'
+    JQ_VERSION='1.7.1'
+    CLOUDFLARED_BIN=''
+    VERSION_FILE="$SEC/coolify-setup.version"
     SETUP_ENV_FILE="$SEC/etc-env"
     SUMMARY_FILE="$SEC/resumen.txt"
     CREDS_FILE="$SEC/credenciales.txt"
@@ -456,6 +463,313 @@ for f in --keep-rescue --purge-installer --installer-user; do
 done
 fi
 
+# --------------------------------------------------------------- descargas
+if want descargas; then
+group "Descargas fijadas y verificadas (#5, #2)"
+
+# Guardian de regresion de #5: 'latest' no puede volver. Con 'latest' dos
+# equipos hechos con la misma ISO acaban con binarios distintos, y ademas no
+# hay hash posible que comprobar.
+if grep -q 'releases/latest/download' "$ROOT/setup.sh"; then
+    bad "setup.sh no descarga de 'releases/latest'" \
+        "$(grep -n 'releases/latest/download' "$ROOT/setup.sh" | head -2)"
+else
+    ok "setup.sh no descarga de 'releases/latest'"
+fi
+if grep -q 'releases/download/\$CLOUDFLARED_VERSION/' "$ROOT/setup.sh"; then
+    ok "cloudflared se descarga de una version concreta"
+else
+    bad "cloudflared se descarga de una version concreta"
+fi
+case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+    *--cloudflared-version*) ok "--cloudflared-version aparece en la ayuda" ;;
+    *) bad "--cloudflared-version aparece en la ayuda" ;;
+esac
+# Sin guarda de sistema operativo, en macOS se componia
+# 'cloudflared-darwin-amd64', que no existe como asset, y moria con un 404.
+sed -n '/^do_cloudflared_bin() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/cfbin.sh"
+if grep -q 'OS_N" != linux' "$TMP/cfbin.sh"; then
+    ok "do_cloudflared_bin tiene guarda de sistema operativo"
+else
+    bad "do_cloudflared_bin tiene guarda de sistema operativo" "en macOS moriria con un 404"
+fi
+
+# --- verificacion de integridad (#2) -------------------------------------
+# Las funciones se cargan en este shell con eval, como en los demas grupos.
+eval "$(sed -n '/^sha256_of() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^verify_sha256() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^known_sha256() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^verify_artifact() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^warn_unverified() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^fetch_artifact() {/,/^}/p' "$ROOT/setup.sh")"
+
+D="$TMP/dl"; mkdir -p "$D"
+VLOG="$D/diag"
+: > "$VLOG"
+# Diagnostico capturado: asi se puede comprobar que el aviso se emite de verdad
+# y no solo que la funcion devuelve 0.
+_logfile() { printf 'LOG: %s\n' "$*" >> "$VLOG"; }
+err()  { printf 'ERR: %s\n' "$*" >> "$VLOG"; }
+warn() { printf 'WARN: %s\n' "$*" >> "$VLOG"; }
+note() { printf 'NOTE: %s\n' "$*" >> "$VLOG"; }
+info() { printf 'INFO: %s\n' "$*" >> "$VLOG"; }
+have_real() { command -v "$1" >/dev/null 2>&1; }
+have() { have_real "$1"; }
+
+# SHA-256 del fichero vacio. Es una constante publica y conocida: sirve de
+# vector de prueba sin tener que calcularla con la misma herramienta que se
+# esta probando, que seria circular.
+EMPTY_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+: > "$D/vacio"
+
+n=0
+for tool in sha256sum shasum openssl; do
+    have_real "$tool" || continue
+    # Se fuerza un backend concreto haciendo que 'have' solo reconozca ese.
+    eval "have() { [ \"\$1\" = $tool ] && have_real $tool; }"
+    is "sha256_of via $tool" "$EMPTY_SHA" "$(sha256_of "$D/vacio")"
+    n=$((n+1))
+done
+have() { have_real "$1"; }
+if [ "$n" -gt 0 ]; then
+    ok "hay al menos una herramienta de hash ($n probada(s))"
+else
+    bad "hay al menos una herramienta de hash" "ni sha256sum ni shasum ni openssl"
+fi
+
+# Hash correcto: rc=0 y el fichero sigue ahi.
+st=0; verify_sha256 "$D/vacio" "$EMPTY_SHA" || st=$?
+is "hash correcto devuelve 0" "0" "$st"
+if [ -f "$D/vacio" ]; then ok "hash correcto conserva el fichero"
+else bad "hash correcto conserva el fichero"; fi
+
+# Hash que no cuadra: rc!=0 y el fichero DESAPARECE. Dejarlo seria dejar puesta
+# la trampa para el paso siguiente, que es justo lo que se quiere evitar.
+printf 'binario falsificado\n' > "$D/malo"
+: > "$VLOG"
+st=0; verify_sha256 "$D/malo" "$EMPTY_SHA" || st=$?
+is "hash que no cuadra devuelve !=0" "1" "$st"
+if [ -e "$D/malo" ]; then bad "un hash que no cuadra borra el fichero" "quedo instalado"
+else ok "un hash que no cuadra borra el fichero"; fi
+if grep -q 'ERR: .*esperado' "$VLOG" && grep -q 'ERR: .*obtenido' "$VLOG"; then
+    ok "y dice el esperado y el obtenido"
+else
+    bad "y dice el esperado y el obtenido" "$(head -3 "$VLOG")"
+fi
+
+# Sin NINGUNA herramienta de hash tiene que fallar, no continuar a ciegas.
+# Se simula redefiniendo 'have', no vaciando el PATH: vaciarlo rompe tambien
+# el rm de la propia funcion en shells sin builtin.
+printf 'contenido\n' > "$D/sinhash"
+: > "$VLOG"
+have() { return 1; }
+st=0; verify_sha256 "$D/sinhash" "$EMPTY_SHA" || st=$?
+have() { have_real "$1"; }
+is "sin herramienta de hash falla" "1" "$st"
+if [ -e "$D/sinhash" ]; then bad "sin herramienta de hash tampoco deja el fichero"
+else ok "sin herramienta de hash tampoco deja el fichero"; fi
+if grep -q 'No se continúa sin verificar' "$VLOG"; then
+    ok "y lo dice en vez de callarse"
+else
+    bad "y lo dice en vez de callarse" "$(head -3 "$VLOG")"
+fi
+
+# La tabla tiene que cubrir lo que el script descarga por defecto, en las dos
+# arquitecturas. Un hueco aqui significa una instalacion que aborta.
+for k in cloudflared-2026.8.2-linux-amd64 cloudflared-2026.8.2-linux-arm64 \
+         jq-1.7.1-jq-linux-amd64 jq-1.7.1-jq-linux-arm64 \
+         jq-1.7.1-jq-macos-amd64 jq-1.7.1-jq-macos-arm64; do
+    h=$(known_sha256 "$k" 2>/dev/null || true)
+    case "$h" in
+        ????????????????????????????????????????????????????????????????)
+            ok "hay hash conocido para $k" ;;
+        *)  bad "hay hash conocido para $k" "obtenido [$h]" ;;
+    esac
+done
+st=0; known_sha256 cloudflared-9999.1.1-linux-amd64 >/dev/null || st=$?
+is "una version desconocida no inventa hash" "1" "$st"
+
+# El pin de la linea de comandos manda sobre la tabla: es lo que permite pedir
+# una version que este script no conoce sin renunciar a verificar.
+: > "$D/pin"
+st=0; verify_artifact "$D/pin" cloudflared-9999.1.1-linux-amd64 "$EMPTY_SHA" || st=$?
+is "el pin a mano permite una version desconocida" "0" "$st"
+: > "$D/nopin"
+: > "$VLOG"
+st=0; verify_artifact "$D/nopin" cloudflared-9999.1.1-linux-amd64 '' || st=$?
+is "sin pin ni tabla, aborta" "1" "$st"
+if [ -e "$D/nopin" ]; then bad "sin pin ni tabla no deja el fichero"
+else ok "sin pin ni tabla no deja el fichero"; fi
+
+# Docker y Coolify no tienen artefacto verificable: lo minimo es decirlo, por
+# pantalla y en el log. Antes no se decia nada en ninguno de los dos sitios.
+: > "$VLOG"
+warn_unverified Docker https://get.docker.com --pin-docker
+if grep -q 'WARN: SIN VERIFICAR' "$VLOG" && grep -q 'pin-docker' "$VLOG"; then
+    ok "sin pin se avisa y se dice como fijarlo"
+else
+    bad "sin pin se avisa y se dice como fijarlo" "$(head -3 "$VLOG")"
+fi
+sed -n '/^do_docker() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/dodocker.sh"
+sed -n '/^do_coolify() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/docoolify.sh"
+for f in dodocker docoolify; do
+    if grep -q 'warn_unverified' "$TMP/$f.sh" && grep -q 'verify_sha256' "$TMP/$f.sh"; then
+        ok "$f: pin si lo hay, aviso si no"
+    else
+        bad "$f: pin si lo hay, aviso si no"
+    fi
+done
+
+# --offline-dir: coge el artefacto del directorio y no toca la red.
+OFF="$D/offline"; mkdir -p "$OFF"
+printf 'soy el instalador\n' > "$OFF/get-docker.sh"
+OFFLINE_DIR="$OFF"
+fetch_file() { bad "fetch_artifact ha ido a la red con --offline-dir puesto"; return 1; }
+st=0; fetch_artifact https://get.docker.com "$D/traido" get-docker.sh || st=$?
+is "--offline-dir trae el artefacto sin red" "0" "$st"
+is "y con el contenido correcto" "soy el instalador" "$(cat "$D/traido" 2>/dev/null || true)"
+: > "$VLOG"
+st=0; fetch_artifact https://get.docker.com "$D/nada" jq-linux-amd64 || st=$?
+is "--offline-dir sin el fichero falla" "1" "$st"
+if grep -q "no contiene 'jq-linux-amd64'" "$VLOG"; then
+    ok "y dice exactamente que fichero falta"
+else
+    bad "y dice exactamente que fichero falta" "$(head -3 "$VLOG")"
+fi
+# La consume fetch_artifact, cargada con eval: el analizador no puede verlo.
+# shellcheck disable=SC2034
+OFFLINE_DIR=''
+
+for f in --pin-docker --pin-coolify --pin-cloudflared --offline-dir; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
+# ---------------------------------------------------------------- versionado
+if want version; then
+group "Versionado (#13)"
+
+# --version en AMBOS scripts. Antes no existia en ninguno: la unica aparicion
+# de la cadena en todo el arbol era el '--version' de cloudflared.
+st=0; out=$(sh "$ROOT/setup.sh" --version 2>&1) || st=$?
+is "setup.sh --version sale con 0" "0" "$st"
+case "$out" in
+    'setup.sh '[0-9]*) ok "setup.sh --version imprime una version" ;;
+    *) bad "setup.sh --version imprime una version" "[$out]" ;;
+esac
+st=0; out=$(sh "$ROOT/build-usb.sh" --version 2>&1) || st=$?
+is "build-usb.sh --version sale con 0" "0" "$st"
+if have git && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    is "build-usb.sh --version coincide con git describe" \
+        "build-usb.sh $(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null)" "$out"
+else
+    is "build-usb.sh --version fuera de un repo lo dice" "build-usb.sh sin-git" "$out"
+fi
+
+# La version viaja por el entorno, no por un marcador dentro de setup.sh:
+# build-usb.sh exige que el script incrustado sea identico byte a byte al
+# original, y un marcador sustituido romperia ese invariante.
+out=$(env SETUP_VERSION=9.9.9-prueba sh "$ROOT/setup.sh" --version 2>&1 || true)
+case "$out" in
+    *9.9.9-prueba*) ok "SETUP_VERSION del entorno manda sobre el literal" ;;
+    *) bad "SETUP_VERSION del entorno manda sobre el literal" "[$out]" ;;
+esac
+if grep -qE '^__[A-Z_]*VERSION[A-Z_]*__$' "$ROOT/setup.sh"; then
+    bad "setup.sh no lleva marcador de version que sustituir" \
+        "romperia la igualdad byte a byte con el incrustado"
+else
+    ok "setup.sh no lleva marcador de version que sustituir"
+fi
+if grep -q 'SETUP_VERSION' "$ROOT/cloud-init/user-data.tpl"; then
+    bad "la plantilla no hornea la version a mano" "debe salir de env_lines"
+else
+    ok "la plantilla no hornea la version a mano"
+fi
+
+# El resumen y /etc/coolify-setup.version. Se reusa el mismo aparejo del grupo
+# de secretos: write_summaries cargada con eval.
+eval "$(sed -n '/^comp_version() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^version_table() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
+have() { command -v "$1" >/dev/null 2>&1; }
+_ts() { echo '2026-01-01 00:00:00'; }
+svc_state() { echo activo; }
+# Las consumen las funciones cargadas con eval: el analizador no puede verlo.
+# shellcheck disable=SC2034
+setup_version_fixture() {
+    VER="$TMP/ver"; mkdir -p "$VER"
+    VERSION='1.2.3-abc'
+    VERSION_SOURCE='horneada al construir'
+    CLOUDFLARED_VERSION='2026.8.2'
+    JQ_VERSION='1.7.1'
+    CLOUDFLARED_BIN=''
+    NEW_HOSTNAME='maquina'; TIMEZONE='Europe/Madrid'; TIMEZONE_SOURCE='sistema'
+    ADMIN_USER='admin'; ADMIN_PASSWORD='CLAVEADMIN123'; SSH_KEY=''
+    COOLIFY_FQDN='coolify.fompi.net'; COOLIFY_EMAIL='a@b.com'
+    COOLIFY_PASSWORD='CLAVECOOLIFY456'; COOLIFY_REGISTERED=1; SKIP_COOLIFY=''
+    APP_SUBDOMAIN='app'; ROOT_DOMAIN='fompi.net'; APP_WILDCARD='*.app.fompi.net'
+    TUNNEL_ID='tid'; INSTALLER_USER='installer'
+    INSTALLER_STATE='bloqueada, fuera de sudo y con shell /usr/sbin/nologin'
+    LOG_FILE="$VER/log"; IS_ROOT=''; KEEP_SECRETS=''
+    SETUP_ENV_FILE="$VER/etc-env"
+    SUMMARY_FILE="$VER/resumen.txt"; CREDS_FILE="$VER/credenciales.txt"
+    CONFIG_FILE="$VER/config.env"; TUNNEL_FILE="$VER/tunnel.env"
+    VERSION_FILE="$VER/coolify-setup.version"
+}
+setup_version_fixture
+write_summaries
+case "$(cat "$SUMMARY_FILE")" in
+    *VERSIONES*'1.2.3-abc'*) ok "el resumen lleva la tabla de versiones" ;;
+    *) bad "el resumen lleva la tabla de versiones" ;;
+esac
+for k in Docker Coolify cloudflared 'Sistema base'; do
+    case "$(cat "$SUMMARY_FILE")" in
+        *"$k"*) ok "la tabla nombra $k" ;;
+        *) bad "la tabla nombra $k" ;;
+    esac
+done
+if [ -f "$VERSION_FILE" ]; then ok "se escribe el fichero de versiones"
+else bad "se escribe el fichero de versiones"; fi
+is "y dice la version del proyecto" "1.2.3-abc" \
+    "$(sed -n 's/^proyecto=//p' "$VERSION_FILE" 2>/dev/null || true)"
+# Ninguna fila puede quedar vacia: en blanco no se distingue "no instalado" de
+# "no lo supimos averiguar", que es justo lo que importa al depurar.
+n=$(grep -cE '^[a-z_]+=$' "$VERSION_FILE" 2>/dev/null || true)
+is "ninguna fila del fichero queda vacia" "0" "$n"
+# 0644: no lleva secretos y su gracia es poder leerlo sin ser root.
+if have stat; then
+    m=$(stat -c %a "$VERSION_FILE" 2>/dev/null || stat -f %Lp "$VERSION_FILE" 2>/dev/null || echo '?')
+    is "el fichero de versiones queda en 0644" "644" "$m"
+fi
+if grep -q 'CLAVEADMIN123\|CLAVECOOLIFY456' "$VERSION_FILE"; then
+    bad "el fichero de versiones no lleva contrasenas" "y es 0644"
+else
+    ok "el fichero de versiones no lleva contrasenas"
+fi
+
+# La trampa de #13: build-usb.sh generaba el EnvironmentFile en DOS sitios (el
+# bloque write_files y el /cidata de la ISO). Ahora sale de env_lines, y tiene
+# que usarse en los dos.
+is "env_lines se define una sola vez" "1" \
+    "$(grep -c '^env_lines() {' "$ROOT/build-usb.sh" || true)"
+if grep -q 'env_lines | sed' "$ROOT/build-usb.sh"; then
+    ok "el bloque write_files sale de env_lines"
+else
+    bad "el bloque write_files sale de env_lines"
+fi
+if grep -q 'env_lines > "$TMP/cidata/coolify-setup.env"' "$ROOT/build-usb.sh"; then
+    ok "el /cidata de la ISO sale del mismo env_lines"
+else
+    bad "el /cidata de la ISO sale del mismo env_lines" \
+        "es el camino que de verdad funciona: late-commands copia de ahi"
+fi
+n=$(grep -c 'CF_API_TOKEN=%s' "$ROOT/build-usb.sh" || true)
+is "el token se escribe en un solo sitio" "1" "$n"
+fi
+
 # --------------------------------------------------------------- resolucion
 if want resolution; then
 group "Resolucion de configuracion (contra la API simulada)"
@@ -553,6 +867,19 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
         *"*.nuevo.fompi.net"*) ok "los argumentos pisan lo guardado" ;;
         *) bad "los argumentos pisan lo guardado" "$(printf '%s' "$out" | grep Apps || true)" ;;
     esac
+
+    # #5: el pin de cloudflared tiene que sobrevivir al reintento; si no, un
+    # segundo intento instalaria otra version y adios reproducibilidad.
+    V="$TMP/cfver"
+    env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$V" HOME="$TMP" NO_COLOR=1 \
+        sh "$ROOT/setup.sh" --cf-token=GOODTOKEN --domain=fompi.net \
+        --cloudflared-version=2020.1.1 --dry-run --non-interactive >/dev/null 2>&1 || true
+    if grep -q "CLOUDFLARED_VERSION='2020.1.1'" "$V/coolify-setup/config.env" 2>/dev/null; then
+        ok "--cloudflared-version se guarda para el reintento"
+    else
+        bad "--cloudflared-version se guarda para el reintento" \
+            "$(grep -c . "$V/coolify-setup/config.env" 2>/dev/null || echo 'sin config.env')"
+    fi
 
     # #3: si el asistente falla a mitad, los secretos TIENEN que seguir ahi
     # para que el reintento no vuelva a pedir el token. Sin --dry-run y sin
@@ -1067,6 +1394,48 @@ open('$TMP/lc.sh','w').write(d['late-commands'][0])
             || stat -f %Lp "$FAKE/target/etc/coolify-setup.env" 2>/dev/null || echo '?')
         is "el env con el token queda en 0600" "600" "$m"
     fi
+
+    # #13: build-usb.sh generaba el EnvironmentFile en dos sitios y este -el de
+    # /cidata, que es el que late-commands copia y por tanto el que de verdad
+    # funciona- era el que se quedaba sin la version si solo se tocaba el otro.
+    # Se genera aqui con el MISMO env_lines del script, no con una copia.
+    # Las consumen project_version y env_lines, cargadas con eval: el
+    # analizador no puede verlo, de ahi la directiva.
+    # shellcheck disable=SC2034
+    HERE_B="$ROOT"
+    eval "$(sed -n '/^project_version() {/,/^}/p' "$ROOT/build-usb.sh" | sed 's/\$HERE/$HERE_B/g')"
+    BUILD_VERSION=$(project_version)
+    # shellcheck disable=SC2034
+    CF_TOKEN=''
+    # shellcheck disable=SC2034
+    PASSTHRU=''
+    eval "$(sed -n '/^env_lines() {/,/^}/p' "$ROOT/build-usb.sh")"
+
+    FK2="$TMP/fake2"; mkdir -p "$FK2/cdrom/cidata" "$FK2/target"
+    cp "$ROOT/setup.sh" "$FK2/cdrom/cidata/coolify-setup.sh"
+    cp "$ROOT/cloud-init/coolify-setup.service" "$FK2/cdrom/cidata/"
+    env_lines > "$FK2/cdrom/cidata/coolify-setup.env"
+    if grep -q '^SETUP_VERSION=' "$FK2/cdrom/cidata/coolify-setup.env"; then
+        ok "el env del /cidata lleva SETUP_VERSION sin token de por medio"
+    else
+        bad "el env del /cidata lleva SETUP_VERSION sin token de por medio" \
+            "$(cat "$FK2/cdrom/cidata/coolify-setup.env")"
+    fi
+    sed -e "s#^for d in .*; do#for d in $FK2/cdrom/cidata; do#" \
+        -e "s#/target#$FK2/target#g" "$TMP/lc.sh" > "$TMP/lc-fake2.sh"
+    sh "$TMP/lc-fake2.sh" >/dev/null 2>&1 || true
+    if grep -q "^SETUP_VERSION=$BUILD_VERSION\$" "$FK2/target/etc/coolify-setup.env" 2>/dev/null; then
+        ok "la version llega a /etc/coolify-setup.env por late-commands"
+    else
+        bad "la version llega a /etc/coolify-setup.env por late-commands" \
+            "el camino que de verdad funciona se quedaria sin version"
+    fi
+    # Y el asistente tiene que cogerla de ahi: es lo que hace util todo esto.
+    out=$(env SETUP_VERSION="$BUILD_VERSION" sh "$ROOT/setup.sh" --version 2>&1 || true)
+    case "$out" in
+        *"$BUILD_VERSION"*) ok "y setup.sh la lee del EnvironmentFile" ;;
+        *) bad "y setup.sh la lee del EnvironmentFile" "[$out]" ;;
+    esac
 fi
 fi
 
