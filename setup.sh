@@ -143,7 +143,10 @@ CONTROL
   --skip-docker          No instalar Docker.
   --skip-coolify         No instalar Coolify.
   --skip-tunnel          No crear el túnel de Cloudflare.
-  --reset                Olvidar el estado previo y empezar de cero.
+  --reset                Olvidar el estado LOCAL y empezar de cero. No toca
+                         nada en Cloudflare: el túnel y los CNAME siguen ahí y
+                         se reutilizan al reejecutar. Tampoco desinstala Docker
+                         ni Coolify.
   --keep-secrets         No borrar al terminar los ficheros con el token de
                          Cloudflare, el del túnel y la configuración resuelta.
   --summary-no-secrets   No imprimir contraseñas por pantalla al terminar; se
@@ -607,6 +610,19 @@ valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
 
+# Nombre del túnel a partir del FQDN del panel. NO del hostname: reinstalar el
+# mini PC con otro hostname creaba un túnel nuevo y dejaba el viejo huérfano en
+# la cuenta, apuntando a una máquina que ya no existe (#15). Lo que identifica
+# de verdad el despliegue es el dominio donde se publica, que sobrevive al
+# formateo. El prefijo 'coolify-' hace reconocible lo que creamos nosotros, y
+# el recorte a 63 es el límite de Cloudflare.
+tunnel_name() {
+    printf '%s' "coolify-$1" \
+        | tr 'A-Z' 'a-z' \
+        | sed 's/[^a-z0-9.-]/-/g' \
+        | cut -c1-63
+}
+
 # Zona horaria que ya tiene el sistema, por stdout; cadena vacía si no hay.
 # El parámetro RAIZ solo existe para poder probar la función contra un /etc
 # simulado: en producción se llama sin argumentos. Eso es justo lo que detecta
@@ -947,6 +963,7 @@ fi
 
 APP_WILDCARD="*.$APP_SUBDOMAIN.$ROOT_DOMAIN"
 COOLIFY_FQDN="$COOLIFY_SUBDOMAIN.$ROOT_DOMAIN"
+TUNNEL_NAME=$(tunnel_name "$COOLIFY_FQDN")
 
 # --- Guardar configuración resuelta para reintentos ----------------------
 save_config() {
@@ -987,6 +1004,7 @@ CONFIG_SUMMARY="Configuración resuelta:
   Apps .............. https://$APP_WILDCARD  ->  localhost:80
   Panel Coolify ..... https://$COOLIFY_FQDN  ->  localhost:8000
   Email Coolify ..... $COOLIFY_EMAIL
+  Túnel ............. $TUNNEL_NAME (se reutiliza si ya existe)
 
   Contraseñas generadas automáticamente; al terminar quedan en
   $CREDS_FILE (modo 0600), no en el resumen."
@@ -1233,16 +1251,37 @@ TUNNEL_FILE="$STATE_DIR/tunnel.env"
 # shellcheck source=/dev/null
 [ -f "$TUNNEL_FILE" ] && . "$TUNNEL_FILE"
 
+# ID del túnel que se llame exactamente así, o vacío si no hay ninguno.
+tunnel_id_by_name() {
+    cf_call GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$1&is_deleted=false" 2>/dev/null \
+        | json_get '.result[0].id' || true
+}
+
 do_tunnel_create() {
     [ -n "$SKIP_TUNNEL" ] && return 0
-    tname="coolify-$NEW_HOSTNAME"
+    tname=$TUNNEL_NAME
+    # Como se llamaba antes de #15. Sigue habiendo instalaciones con ese nombre.
+    legacy="coolify-$NEW_HOSTNAME"
 
-    # Reutilizar el túnel si ya existe con ese nombre (reintentos limpios).
-    existing=$(cf_call GET "/accounts/$ACCOUNT_ID/cfd_tunnel?name=$tname&is_deleted=false" 2>/dev/null \
-        | json_get '.result[0].id' || true)
+    # Reutilizar el túnel si ya existe con ese nombre (reintentos limpios, y
+    # reinstalaciones del mismo despliegue).
+    existing=$(tunnel_id_by_name "$tname")
+    if [ -n "$existing" ]; then
+        note "Reutilizando el túnel existente '$tname'"
+    elif [ "$legacy" != "$tname" ]; then
+        # Compatibilidad hacia atrás: si el despliegue ya tiene túnel con el
+        # nombre viejo, se reutiliza ESE. Crear uno nuevo al lado dejaría
+        # huérfano justo el que está en uso, que es el problema de #15 al revés.
+        existing=$(tunnel_id_by_name "$legacy")
+        if [ -n "$existing" ]; then
+            tname=$legacy
+            note "Reutilizando el túnel heredado '$legacy' (nombre anterior a #15)."
+            note "No se renombra ni se crea otro: los CNAME en uso apuntan a este."
+        fi
+    fi
+
     if [ -n "$existing" ]; then
         TUNNEL_ID=$existing
-        note "Reutilizando el túnel existente '$tname'"
         tok=$(cf_call GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/token" | json_get '.result') || return 1
         TUNNEL_TOKEN=$tok
     else
@@ -1250,11 +1289,16 @@ do_tunnel_create() {
         resp=$(cf_call POST "/accounts/$ACCOUNT_ID/cfd_tunnel" "$body") || return 1
         TUNNEL_ID=$(printf '%s' "$resp" | json_get '.result.id')
         TUNNEL_TOKEN=$(printf '%s' "$resp" | json_get '.result.token')
+        note "Túnel creado: $tname"
     fi
     [ -n "$TUNNEL_ID" ] && [ -n "$TUNNEL_TOKEN" ] || { err "No se obtuvo el ID/token del túnel."; return 1; }
 
+    TUNNEL_NAME=$tname
     umask 077
-    printf "TUNNEL_ID='%s'\nTUNNEL_TOKEN='%s'\n" "$TUNNEL_ID" "$TUNNEL_TOKEN" > "$TUNNEL_FILE"
+    # El nombre se anota a propósito: es lo que permite identificar después qué
+    # túnel de la cuenta creamos nosotros y para qué despliegue.
+    printf "TUNNEL_ID='%s'\nTUNNEL_NAME='%s'\nTUNNEL_TOKEN='%s'\n" \
+        "$TUNNEL_ID" "$TUNNEL_NAME" "$TUNNEL_TOKEN" > "$TUNNEL_FILE"
     chmod 600 "$TUNNEL_FILE"
 }
 run_step tunnel_create "Túnel de Cloudflare" do_tunnel_create
@@ -1593,8 +1637,12 @@ write_summaries() {
         printf '  el comodín ya está enrutado, no hay que tocar DNS por cada app.\n'
         printf '\nCLOUDFLARE TUNNEL\n'
         printf '  Zona .............. %s\n' "$ROOT_DOMAIN"
+        printf '  Túnel ............. %s\n' "${TUNNEL_NAME:-omitido}"
         printf '  Tunnel ID ......... %s\n' "${TUNNEL_ID:-omitido}"
         printf '  CNAME ............. %s y %s\n' "$APP_WILDCARD" "$COOLIFY_FQDN"
+        printf '  El nombre del túnel sale del dominio del panel, no del hostname:\n'
+        printf '  reinstalar este equipo reutiliza este mismo túnel. Nada de lo que\n'
+        printf '  hay en Cloudflare se borra solo, tampoco con --reset.\n'
         printf '\nESTADO DE SERVICIOS\n'
         printf '  docker ............ %s\n' "$(svc_state docker)"
         printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"

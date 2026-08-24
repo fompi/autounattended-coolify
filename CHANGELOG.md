@@ -30,6 +30,15 @@ Versionado [semántico](https://semver.org/lang/es/).
   aborta la instalación y el resumen dice siempre cómo quedó la cuenta.
 
 ### Corregido
+- **Reejecutar dejaba túneles huérfanos en Cloudflare** ([#15]). El nombre del
+  túnel era `coolify-$HOSTNAME`, así que reinstalar el equipo con otro hostname
+  creaba uno nuevo y abandonaba el viejo apuntando a una máquina que ya no
+  existe. Ahora se deriva del FQDN del panel —que es lo que identifica el
+  despliegue y sobrevive al formateo—, recortado a los 63 caracteres que
+  admite Cloudflare. Los túneles con el nombre antiguo se detectan y se
+  reutilizan tal cual, sin renombrarlos ni duplicarlos. El nombre se anota en
+  `tunnel.env` y en el resumen para poder identificar después lo que creamos
+  nosotros, y la ayuda de `--reset` deja claro que no borra nada en Cloudflare.
 - **El paso `tunnel_service` daba falsos positivos** ([#6]). `systemctl
   is-active` tras un `sleep 5` no prueba nada: `cloudflared` arranca y
   reintenta en bucle aunque el token no valga. Ahora se le pregunta a
@@ -68,3 +77,4 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
+[#15]: https://github.com/fompi/autounattended-coolify/issues/15
