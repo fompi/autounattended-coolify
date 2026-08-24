@@ -29,6 +29,7 @@ import re
 import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
 NZONES = 1
@@ -131,9 +132,13 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["tunnels"][tid] = body.get("name")
                 return self._ok({"id": tid, "name": body.get("name"),
                                  "token": tunnel_token(m.group(1), tid)})
+            # Sin filtro name= el real devuelve TODOS los tuneles de la
+            # cuenta, no una lista vacia; es como se comprueba que reejecutar
+            # no deja tuneles huerfanos (#15).
             wanted = re.search(r"name=([^&]+)", path)
+            name = unquote(wanted.group(1)) if wanted else None
             found = [{"id": k, "name": v} for k, v in STATE["tunnels"].items()
-                     if wanted and v == wanted.group(1)]
+                     if name is None or v == name]
             return self._ok(found, result_info={"count": len(found)})
 
         m = re.match(r"^/zones/([^/]+)/dns_records/([^/?]+)$", path)

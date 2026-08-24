@@ -13,7 +13,8 @@
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
 # que si se cubre del tunel es el resto: la logica de espera, reintento y
-# fallo del paso tunnel_service, contra el simulador.
+# fallo del paso tunnel_service, y el nombre estable del tunel entre
+# reinstalaciones, todo contra el simulador.
 
 set -eu
 
@@ -270,6 +271,7 @@ fake_config() {
     ROOT_DOMAIN='fompi.net'
     APP_WILDCARD='*.app.fompi.net'
     TUNNEL_ID='tid'
+    TUNNEL_NAME='coolify-coolify.fompi.net'
     INSTALLER_USER='installer'
     INSTALLER_STATE='bloqueada, fuera de sudo y con shell /usr/sbin/nologin'
     LOG_FILE="$SEC/log"
@@ -301,6 +303,16 @@ esac
 case "$(cat "$SUMMARY_FILE")" in
     *'Cuenta de rescate'*'fuera de sudo'*) ok "el resumen dice como quedo la cuenta de rescate" ;;
     *) bad "el resumen dice como quedo la cuenta de rescate" ;;
+esac
+# Sin el nombre del tunel no hay forma de saber luego cual de los de la cuenta
+# es el de este equipo (#15).
+case "$(cat "$SUMMARY_FILE")" in
+    *'coolify-coolify.fompi.net'*) ok "el resumen dice como se llama el tunel" ;;
+    *) bad "el resumen dice como se llama el tunel" ;;
+esac
+case "$(cat "$SUMMARY_FILE")" in
+    *'tampoco con --reset'*) ok "y avisa de que --reset no borra nada en Cloudflare" ;;
+    *) bad "y avisa de que --reset no borra nada en Cloudflare" ;;
 esac
 if have stat; then
     for f in "$SUMMARY_FILE" "$CREDS_FILE"; do
@@ -573,7 +585,7 @@ fi
 
 # ----------------------------------------------------------------- tunel
 if want tunnel; then
-group "Tunel: 'activo' no es 'conectado' (#6)"
+group "Tunel: conectado de verdad (#6) y nombre estable (#15)"
 if ! have python3; then
     skip "grupo entero" "hace falta python3 para el simulador"
 else
@@ -756,6 +768,113 @@ PYEOF
     case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
         *TUNNEL_HEALTH_TIMEOUT*) ok "TUNNEL_HEALTH_TIMEOUT aparece en la ayuda" ;;
         *) bad "TUNNEL_HEALTH_TIMEOUT aparece en la ayuda" ;;
+    esac
+
+    # ---- #15: el nombre del tunel no puede depender del hostname ----------
+    eval "$(sed -n '/^tunnel_name() {/,/^}/p' "$ROOT/setup.sh")"
+    is "el nombre sale del FQDN del panel" "coolify-coolify.fompi.net" \
+        "$(tunnel_name coolify.fompi.net)"
+    is "no depende del hostname" "$(tunnel_name coolify.fompi.net)" \
+        "$(tunnel_name coolify.fompi.net)"
+    is "en minusculas" "coolify-panel.fompi.net" "$(tunnel_name PANEL.Fompi.NET)"
+    largo=$(tunnel_name "$(printf 'abcdefghij%.0s' 1 2 3 4 5 6 7 8).net")
+    is "recortado al limite de Cloudflare" "63" "${#largo}"
+    case "$(tunnel_name 'raro/$ nombre.net')" in
+        *' '*|*'/'*|*'$'*) bad "descarta los caracteres que no valen" ;;
+        *) ok "descarta los caracteres que no valen" ;;
+    esac
+    case "$(tunnel_name coolify.fompi.net)" in
+        coolify-*) ok "lleva prefijo reconocible" ;;
+        *) bad "lleva prefijo reconocible" ;;
+    esac
+
+    # Llegar al paso del tunel sin ser root: se premarcan los pasos que tocan
+    # el sistema (antes y despues) y se deja correr el resto de verdad. Es mas
+    # honesto que probar la funcion suelta, porque se ejerce el script entero:
+    # resolucion, creacion del tunel, ingress y DNS contra el simulador.
+    HOMEDIR="$TMP/home"; mkdir -p "$HOMEDIR"
+    run_hasta_tunel() { # run_hasta_tunel DIRESTADO ARGS...
+        _sd=$1; shift
+        mkdir -p "$_sd/coolify-setup"
+        for _st in wifi hostname timezone admin_user docker coolify \
+                   coolify_domain coolify_register cloudflared_bin \
+                   tunnel_service retire_installer; do
+            : > "$_sd/coolify-setup/step.$_st"
+        done
+        env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$_sd" \
+            HOME="$HOMEDIR" NO_COLOR=1 NO_GEOIP=1 \
+            sh "$ROOT/setup.sh" "$@" 2>&1 || true
+    }
+    n_tuneles() { api GET /accounts/acct-1/cfd_tunnel | jget '["result_info"]["count"]'; }
+    nombres_tuneles() { api GET /accounts/acct-1/cfd_tunnel \
+        | python3 -c 'import json,sys;print(",".join(sorted(t["name"] for t in json.load(sys.stdin)["result"])))'; }
+
+    PORT=8805
+    if ! mock_up "$PORT"; then
+        bad "el simulador arranca (#15)" "no llego a escuchar en $PORT"
+    else
+        # El listado sin filtro tiene que devolver lo que hay, no una lista
+        # vacia: es como se comprueba que no quedan tuneles huerfanos.
+        is "el simulador parte sin tuneles" "0" "$(n_tuneles)"
+
+        out=$(run_hasta_tunel "$TMP/i1" --cf-token=GOODTOKEN --domain=fompi.net \
+            --hostname=primera --non-interactive --keep-secrets)
+        is "primera instalacion: un tunel" "1" "$(n_tuneles)"
+        is "con el nombre derivado del FQDN" "coolify-coolify.fompi.net" "$(nombres_tuneles)"
+        case "$out" in
+            *"Túnel creado"*) ok "la primera lo crea" ;;
+            *) bad "la primera lo crea" "$(printf '%s' "$out" | tail -3)" ;;
+        esac
+        if grep -q "TUNNEL_NAME='coolify-coolify.fompi.net'" "$TMP/i1/coolify-setup/tunnel.env"; then
+            ok "el nombre queda anotado en tunnel.env"
+        else
+            bad "el nombre queda anotado en tunnel.env" \
+                "$(sed 's/=.*/=.../' "$TMP/i1/coolify-setup/tunnel.env" 2>/dev/null)"
+        fi
+
+        # Lo de #15: reinstalar el mismo despliegue con otro hostname. Antes
+        # esto dejaba el tunel viejo huerfano en la cuenta.
+        out=$(run_hasta_tunel "$TMP/i2" --cf-token=GOODTOKEN --domain=fompi.net \
+            --hostname=segunda --non-interactive --keep-secrets)
+        is "cambiar el hostname NO crea un tunel nuevo" "1" "$(n_tuneles)"
+        is "y sigue siendo el mismo" "coolify-coolify.fompi.net" "$(nombres_tuneles)"
+        case "$out" in
+            *"Reutilizando el túnel existente"*) ok "lo dice: reutiliza el existente" ;;
+            *) bad "lo dice: reutiliza el existente" "$(printf '%s' "$out" | tail -3)" ;;
+        esac
+        mock_down
+    fi
+
+    # Compatibilidad hacia atras: una instalacion anterior a #15 tiene el tunel
+    # con el nombre viejo. Hay que reutilizarlo, no crear otro al lado: los
+    # CNAME en uso apuntan a ese.
+    PORT=8806
+    if ! mock_up "$PORT"; then
+        bad "el simulador arranca (heredado)" "no llego a escuchar en $PORT"
+    else
+        api POST /accounts/acct-1/cfd_tunnel '{"name":"coolify-vieja"}' >/dev/null
+        is "el simulador tiene el tunel heredado" "1" "$(n_tuneles)"
+        out=$(run_hasta_tunel "$TMP/i3" --cf-token=GOODTOKEN --domain=fompi.net \
+            --hostname=vieja --non-interactive --keep-secrets)
+        is "no se crea uno al lado del heredado" "1" "$(n_tuneles)"
+        is "se conserva el nombre heredado" "coolify-vieja" "$(nombres_tuneles)"
+        case "$out" in
+            *"heredado"*) ok "lo dice: reutiliza el heredado" ;;
+            *) bad "lo dice: reutiliza el heredado" "$(printf '%s' "$out" | tail -3)" ;;
+        esac
+        if grep -q "TUNNEL_NAME='coolify-vieja'" "$TMP/i3/coolify-setup/tunnel.env"; then
+            ok "y anota el nombre que se usa de verdad"
+        else
+            bad "y anota el nombre que se usa de verdad"
+        fi
+        mock_down
+    fi
+
+    # --reset borra estado local; que no se entienda que limpia Cloudflare.
+    ayuda=$(sh "$ROOT/setup.sh" --help 2>&1)
+    case "$ayuda" in
+        *'--reset'*'No toca'*'Cloudflare'*) ok "la ayuda de --reset dice que no toca Cloudflare" ;;
+        *) bad "la ayuda de --reset dice que no toca Cloudflare" ;;
     esac
 fi
 fi
