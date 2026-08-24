@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators resolution build latecommands
+# Grupos: syntax json validators timezone resolution build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y el paso tunnel_service (habla con el edge real de Cloudflare).
@@ -45,7 +45,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators resolution build latecommands}"
+WANTED="${*:-syntax json validators timezone resolution build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -178,6 +178,52 @@ if printf '%s' "$P1" | grep -q '^[A-Za-z0-9]*$'; then ok "contrasena alfanumeric
 else bad "contrasena alfanumerica" "$P1"; fi
 fi
 
+# ---------------------------------------------------------- zona horaria
+if want timezone; then
+group "Zona horaria: sistema antes que geolocalizacion (#12)"
+eval "$(sed -n '/^system_timezone() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^tz_is_placeholder() {/,/^}/p' "$ROOT/setup.sh")"
+
+TZR="$TMP/tzroot"; mkdir -p "$TZR/etc"
+is "sin /etc/timezone ni symlink no inventa nada" "" "$(system_timezone "$TZR")"
+printf 'Europe/Madrid\n' > "$TZR/etc/timezone"
+is "lee /etc/timezone" "Europe/Madrid" "$(system_timezone "$TZR")"
+printf '  Europe/Madrid  \n' > "$TZR/etc/timezone"
+is "recorta espacios y salto de linea" "Europe/Madrid" "$(system_timezone "$TZR")"
+rm -f "$TZR/etc/timezone"
+ln -sf /usr/share/zoneinfo/America/Bogota "$TZR/etc/localtime"
+is "cae al symlink de /etc/localtime" "America/Bogota" "$(system_timezone "$TZR")"
+: > "$TZR/etc/timezone"
+is "/etc/timezone vacio no tapa al symlink" "America/Bogota" "$(system_timezone "$TZR")"
+
+for tz in '' UTC Etc/UTC GMT; do
+    if tz_is_placeholder "$tz"; then ok "tz_is_placeholder('$tz')"
+    else bad "tz_is_placeholder('$tz')" "deberia considerarse vacia"; fi
+done
+for tz in Europe/Madrid America/Bogota Asia/Tokyo; do
+    if tz_is_placeholder "$tz"; then bad "tz_is_placeholder('$tz')" "no es un relleno"
+    else ok "no tz_is_placeholder('$tz')"; fi
+done
+
+# La regla entera: solo se llama a ipapi.co si la zona del sistema no dice
+# nada, no se paso --timezone y no se paso --no-geoip. Se comprueba sobre el
+# texto del script porque la llamada real no se puede hacer en la suite.
+n=$(grep -c 'fetch_stdout "https://ipapi.co' "$ROOT/setup.sh" || true)
+is "una sola llamada a ipapi.co en todo el script" "1" "$n"
+# El aviso tiene que estar ANTES de la llamada, no despues.
+avi=$(grep -n 'se va a consultar https://ipapi.co' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+lla=$(grep -n 'fetch_stdout "https://ipapi.co' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ -n "$avi" ] && [ -n "$lla" ] && [ "$avi" -lt "$lla" ]; then
+    ok "se avisa por pantalla antes de la llamada"
+else
+    bad "se avisa por pantalla antes de la llamada" "aviso en ${avi:-?}, llamada en ${lla:-?}"
+fi
+case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+    *--no-geoip*) ok "--no-geoip aparece en la ayuda" ;;
+    *) bad "--no-geoip aparece en la ayuda" ;;
+esac
+fi
+
 # --------------------------------------------------------------- resolucion
 if want resolution; then
 group "Resolucion de configuracion (contra la API simulada)"
@@ -207,7 +253,7 @@ sys.exit(0 if s.connect_ex(('127.0.0.1', $PORT)) == 0 else 1)" 2>/dev/null; then
     setup() { # setup ARGS... -> salida combinada
         env CF_API_BASE="http://127.0.0.1:$PORT" \
             XDG_STATE_HOME="$(mktemp -d "$TMP/state.XXXXXX")" \
-            HOME="$TMP" NO_COLOR=1 \
+            HOME="$TMP" NO_COLOR=1 NO_GEOIP=1 \
             sh "$ROOT/setup.sh" "$@" 2>&1 || true
     }
 

@@ -106,7 +106,11 @@ SISTEMA (todo opcional, todo derivado o generado si se omite)
   --admin-password=V     Por defecto: se genera. Acepta @fichero / @-.
   --ssh-key=VALOR        Clave pública SSH. Acepta @fichero. Si se indica, se
                          deshabilita la autenticación por contraseña.
-  --timezone=TZ          Por defecto: se deduce por geolocalización de la IP.
+  --timezone=TZ          Por defecto: la del sistema; si el sistema está en UTC,
+                         se deduce por geolocalización de la IP (ver --no-geoip).
+  --no-geoip             No consultar nunca ipapi.co para deducir la zona
+                         horaria: si el sistema no la tiene, se queda en UTC.
+                         Equivale a la variable de entorno NO_GEOIP=1.
   --wifi-ssid=SSID       Solo se usa (y se pregunta) si no hay red al arrancar.
   --wifi-password=V      Acepta @fichero / @-.
 
@@ -142,9 +146,11 @@ argval() {
 CF_TOKEN="${CF_API_TOKEN:-}"
 ROOT_DOMAIN=''; APP_SUBDOMAIN=''; COOLIFY_SUBDOMAIN=''
 NEW_HOSTNAME=''; ADMIN_USER=''; ADMIN_PASSWORD=''; SSH_KEY=''; TIMEZONE=''
+TIMEZONE_SOURCE=''
 WIFI_SSID=''; WIFI_PASSWORD=''
 COOLIFY_EMAIL=''; COOLIFY_PASSWORD=''
 ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
+NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
 
 # Argumentos horneados en el USB al construirlo (via EnvironmentFile del
@@ -173,8 +179,8 @@ while [ $# -gt 0 ]; do
         --admin-password)       shift; ADMIN_PASSWORD=$(argval "$1") ;;
         --ssh-key=*)            SSH_KEY=$(argval "${1#*=}") ;;
         --ssh-key)              shift; SSH_KEY=$(argval "$1") ;;
-        --timezone=*)           TIMEZONE=${1#*=} ;;
-        --timezone)             shift; TIMEZONE=$1 ;;
+        --timezone=*)           TIMEZONE=${1#*=}; TIMEZONE_SOURCE=indicada ;;
+        --timezone)             shift; TIMEZONE=$1; TIMEZONE_SOURCE=indicada ;;
         --wifi-ssid=*)          WIFI_SSID=${1#*=} ;;
         --wifi-ssid)            shift; WIFI_SSID=$1 ;;
         --wifi-password=*)      WIFI_PASSWORD=$(argval "${1#*=}") ;;
@@ -185,6 +191,7 @@ while [ $# -gt 0 ]; do
         --coolify-password)     shift; COOLIFY_PASSWORD=$(argval "$1") ;;
         -y|--yes)               ASSUME_YES=1 ;;
         --non-interactive)      NON_INTERACTIVE=1; ASSUME_YES=1 ;;
+        --no-geoip)             NO_GEOIP=1 ;;
         --skip-docker)          SKIP_DOCKER=1 ;;
         --skip-coolify)         SKIP_COOLIFY=1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
@@ -560,6 +567,30 @@ valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
 
+# Zona horaria que ya tiene el sistema, por stdout; cadena vacía si no hay.
+# El parámetro RAIZ solo existe para poder probar la función contra un /etc
+# simulado: en producción se llama sin argumentos.
+system_timezone() {
+    _tzroot=${1:-}
+    _tz=''
+    if [ -r "$_tzroot/etc/timezone" ]; then
+        _tz=$(tr -d ' \n\r' < "$_tzroot/etc/timezone" 2>/dev/null || true)
+    fi
+    if [ -z "$_tz" ] && [ -L "$_tzroot/etc/localtime" ]; then
+        _tz=$(readlink "$_tzroot/etc/localtime" 2>/dev/null | sed 's#.*/zoneinfo/##')
+    fi
+    printf '%s' "$_tz"
+}
+
+# Cierto si la zona horaria no dice nada del sitio donde está el equipo. UTC no
+# es un dato: es lo que queda cuando nadie ha elegido nada.
+tz_is_placeholder() {
+    case "${1:-}" in
+        ''|UTC|Etc/UTC|GMT|Etc/GMT|Universal|Etc/Universal) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 gen_password() {
     if [ -r /dev/urandom ]; then
         LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | dd bs=1 count=24 2>/dev/null
@@ -609,7 +640,7 @@ if [ -f "$CONFIG_FILE" ]; then
     _logfile "Recuperando configuración previa de $CONFIG_FILE"
     eval "$(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=/SAVED_\1=/p' "$CONFIG_FILE")"
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
-              NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE \
+              NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
               WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
@@ -770,22 +801,40 @@ if [ -z "$SSH_KEY" ] && [ -n "$ADMIN_USER_EXISTED" ]; then
     fi
 fi
 
-# --- Zona horaria: geolocalización -> sistema -> UTC ---------------------
+# --- Zona horaria: sistema -> geolocalización -> UTC ---------------------
+# El orden importa. La zona del sistema ya suele estar bien (el instalador de
+# Ubuntu la fija) y no le cuenta nada a nadie; la geolocalización revela a un
+# tercero la IP pública y el momento de la instalación, así que es el último
+# recurso, se anuncia antes de hacerla y se puede desactivar.
 if [ -z "$TIMEZONE" ]; then
-    TIMEZONE=$(fetch_stdout "https://ipapi.co/timezone" 2>/dev/null | tr -d ' \n\r' || true)
-    if [ -n "$TIMEZONE" ] && [ -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
-        note "Zona horaria deducida por geolocalización: $TIMEZONE"
-    else
-        TIMEZONE=''
-        if [ -r /etc/timezone ]; then
-            TIMEZONE=$(cat /etc/timezone 2>/dev/null | tr -d ' \n\r')
-        elif [ -L /etc/localtime ]; then
-            TIMEZONE=$(readlink /etc/localtime | sed 's#.*/zoneinfo/##')
-        fi
-        : "${TIMEZONE:=UTC}"
+    TIMEZONE=$(system_timezone)
+    if ! tz_is_placeholder "$TIMEZONE"; then
+        TIMEZONE_SOURCE=sistema
         note "Zona horaria del sistema: $TIMEZONE"
+    elif [ -n "$NO_GEOIP" ]; then
+        TIMEZONE_SOURCE=utc
+        : "${TIMEZONE:=UTC}"
+        note "Zona horaria: $TIMEZONE (geolocalización desactivada por --no-geoip/NO_GEOIP)."
+        note "Si no es la que quieres, pásala con --timezone=Area/Ciudad."
+    else
+        warn "El sistema no tiene zona horaria propia; está en ${TIMEZONE:-UTC}."
+        note "Para deducirla se va a consultar https://ipapi.co/timezone, que verá la"
+        note "IP pública de este equipo y el momento de la instalación."
+        note "Para evitarlo: --timezone=Area/Ciudad, o --no-geoip para quedarse en UTC."
+        geo_tz=$(fetch_stdout "https://ipapi.co/timezone" 2>/dev/null | tr -d ' \n\r' || true)
+        if [ -n "$geo_tz" ] && [ -e "/usr/share/zoneinfo/$geo_tz" ]; then
+            TIMEZONE=$geo_tz
+            TIMEZONE_SOURCE=geoip
+            note "Zona horaria deducida por geolocalización: $TIMEZONE"
+        else
+            TIMEZONE_SOURCE=utc
+            : "${TIMEZONE:=UTC}"
+            note "La geolocalización no devolvió una zona válida; se queda en $TIMEZONE."
+        fi
     fi
 fi
+: "${TIMEZONE:=UTC}"
+: "${TIMEZONE_SOURCE:=indicada}"
 
 # --- Datos de Coolify: derivados y generados -----------------------------
 if [ -z "$COOLIFY_EMAIL" ]; then
@@ -824,6 +873,7 @@ ADMIN_USER='$ADMIN_USER'
 ADMIN_PASSWORD='$(printf '%s' "$ADMIN_PASSWORD" | sed "s/'/'\\\\''/g")'
 SSH_KEY='$(printf '%s' "$SSH_KEY" | sed "s/'/'\\\\''/g")'
 TIMEZONE='$TIMEZONE'
+TIMEZONE_SOURCE='$TIMEZONE_SOURCE'
 WIFI_SSID='$(printf '%s' "$WIFI_SSID" | sed "s/'/'\\\\''/g")'
 WIFI_PASSWORD='$(printf '%s' "$WIFI_PASSWORD" | sed "s/'/'\\\\''/g")'
 COOLIFY_EMAIL='$COOLIFY_EMAIL'
@@ -838,7 +888,7 @@ CONFIG_SUMMARY="Configuración resuelta:
 
   Hostname .......... $NEW_HOSTNAME
   Usuario admin ..... $ADMIN_USER $([ -n "$ADMIN_USER_EXISTED" ] && echo '(ya existe, no se toca)' || echo '(se creará)')
-  Zona horaria ...... $TIMEZONE
+  Zona horaria ...... $TIMEZONE (origen: $TIMEZONE_SOURCE)
   Red ............... $([ -n "$WIFI_SSID" ] && echo "WiFi '$WIFI_SSID'" || echo 'Ethernet/DHCP')
 
   Dominio ........... $ROOT_DOMAIN
@@ -1177,7 +1227,7 @@ svc_state() {
     printf '=== Instalación completada — %s ===\n\n' "$(_ts)"
     printf 'SISTEMA\n'
     printf '  Hostname .......... %s\n' "$NEW_HOSTNAME"
-    printf '  Zona horaria ...... %s\n' "$TIMEZONE"
+    printf '  Zona horaria ...... %s (origen: %s)\n' "$TIMEZONE" "$TIMEZONE_SOURCE"
     printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
     if [ -n "$ADMIN_PASSWORD" ]; then
         printf '  Contraseña ........ %s\n' "$ADMIN_PASSWORD"
