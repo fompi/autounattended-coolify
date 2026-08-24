@@ -37,6 +37,10 @@ de root. Conviene tener claro qué protege y qué no.
   `/var/lib/coolify-setup/config.env`, y el del túnel en
   `tunnel.env`, todos en modo 0600. Tienen que seguir ahí: son de donde sale el
   reintento si algo falla a mitad.
+- **`/etc/coolify-setup.version`.** Se escribe en 0644 a propósito: dice qué
+  versión del proyecto y de cada componente instaló el equipo, y no lleva
+  ningún secreto. Cualquier usuario local puede leerlo — es información de
+  inventario, no de acceso.
 - **Credenciales tras la instalación.** Las contraseñas generadas quedan en
   claro en `/root/instalacion-credenciales.txt` (modo 0600, propiedad de root)
   y sin caducidad. Es un compromiso deliberado: sin ellas el equipo queda

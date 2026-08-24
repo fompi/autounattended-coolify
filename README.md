@@ -308,7 +308,7 @@ que usar `--skip-docker` / `--skip-coolify`.
 ## Desarrollo
 
 ```bash
-make test    # 89 comprobaciones, sin dependencias obligatorias
+make test    # 257 comprobaciones, sin dependencias obligatorias
 make lint    # shellcheck en dialecto sh + sintaxis en varios shells
 make build   # genera cloud-init/user-data
 make iso ISO=ubuntu-24.04.4-live-server-amd64.iso
@@ -318,8 +318,9 @@ La suite se salta los grupos para los que le falte una herramienta y lo dice.
 En CI se exige que **no se omita ninguno**: si falta una dependencia en el
 runner, el build falla en vez de dar verde sin haber probado.
 
-Grupos: `syntax`, `json`, `validators`, `resolution`, `build`, `latecommands`.
-Se pueden pedir sueltos: `sh tests/run.sh json build`.
+Grupos: `syntax`, `json`, `validators`, `timezone`, `secrets`, `installer`,
+`descargas`, `version`, `resolution`, `build`, `latecommands`. Se pueden pedir
+sueltos: `sh tests/run.sh json build`.
 
 **Lo que la suite no puede cubrir**, y hay que probar a mano en una VM:
 
@@ -428,6 +429,16 @@ conserva tal cual, y `--installer-user=NOMBRE` sirve si le pusiste otro nombre.
   artefactos de un directorio local, y los verifica igual. Los matices —qué es
   verificación de verdad y qué es confianza en el primer uso— están en
   `SECURITY.md`.
+- **Versiones.** `build-usb.sh` hornea `git describe --tags --always --dirty` en
+  el `user-data`, y viaja hasta el destino por el `EnvironmentFile` de la unidad
+  systemd (`SETUP_VERSION=`); si se construye fuera de un repositorio queda
+  `sin-git`, que también es información. No se sustituye un marcador dentro de
+  `setup.sh` a propósito: `build-usb.sh` exige que el script incrustado sea
+  idéntico **byte a byte** al original. `setup.sh --version` y
+  `build-usb.sh --version` responden en cualquier momento, el resumen final
+  lleva una tabla con proyecto, sistema base, Docker, Coolify, `cloudflared` y
+  `jq`, y lo mismo queda en `/etc/coolify-setup.version` (0644, sin secretos)
+  para poder leerlo después sin rebuscar en el log.
 - **Versiones fijadas.** `cloudflared` y `jq` se instalan en una versión concreta
   escrita en `setup.sh`, no en `latest`: la misma ISO tiene que dar el mismo
   sistema hoy y dentro de seis meses. El contrapeso es que **un pin envejece**:
@@ -461,9 +472,9 @@ detalle, las implicaciones y un esbozo de solución.
 |---|---|
 | [#7](https://github.com/fompi/autounattended-coolify/issues/7) | El registro del primer usuario de Coolify raspa su HTML. Se romperá en alguna actualización. |
 | [#11](https://github.com/fompi/autounattended-coolify/issues/11) | Sin copias, sin actualizaciones planificadas y sin monitorización. |
-| [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Sin versionado real: no se puede saber qué versión instaló un equipo. |
+| [#13](https://github.com/fompi/autounattended-coolify/issues/13) | Quedan pendientes las etiquetas semánticas, el workflow de release y el aviso en CI cuando se toca el código sin tocar el `CHANGELOG.md`. La trazabilidad básica ya está: ver «Versiones» más abajo. |
 | [#14](https://github.com/fompi/autounattended-coolify/issues/14) | CI no se ejecuta por facturación de la cuenta; el badge da rojo sin haber probado nada. |
-| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar ya no deja túneles huérfanos: el nombre sale del dominio, no del hostname. Lo que sigue faltando es un `--cleanup` que liste y borre, con confirmación, los túneles muertos que ya se hubieran acumulado; hoy eso se hace a mano en el panel de Cloudflare. |
+| [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
 
 **Si vas a usarlo en serio**, lo mínimo antes es fijar Docker y Coolify con
 `--pin-docker` / `--pin-coolify` ([#2](https://github.com/fompi/autounattended-coolify/issues/2)),

@@ -17,7 +17,18 @@
 
 set -eu
 
-VERSION="2.0"
+# La version la hornea build-usb.sh al construir, y viaja por el
+# EnvironmentFile de la unidad systemd (SETUP_VERSION=...). NO se sustituye un
+# marcador dentro de este fichero, y no es un capricho: build-usb.sh comprueba
+# que el setup.sh incrustado en el user-data sea identico BYTE A BYTE al
+# original, y un marcador sustituido romperia ese invariante. El literal es
+# solo el respaldo de cuando el script viaja solo ('curl | sh').
+VERSION="${SETUP_VERSION:-0.2.0}"
+if [ -n "${SETUP_VERSION:-}" ]; then
+    VERSION_SOURCE='horneada al construir'
+else
+    VERSION_SOURCE='literal del script (no horneada)'
+fi
 UA="coolify-setup/$VERSION"
 
 # Versiones fijadas de lo que se descarga. Antes cloudflared venia de
@@ -36,11 +47,15 @@ if [ "$(id -u)" = "0" ]; then
     LOG_FILE=/var/log/coolify-setup.log
     SUMMARY_FILE=/root/instalacion-resumen.txt
     CREDS_FILE=/root/instalacion-credenciales.txt
+    # 0644 a proposito: no lleva secretos y su gracia es poder leerlo sin ser
+    # root cuando alguien pregunta "que version tienes?".
+    VERSION_FILE=/etc/coolify-setup.version
 else
     STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/coolify-setup"
     LOG_FILE="$STATE_DIR/setup.log"
     SUMMARY_FILE="$HOME/instalacion-resumen.txt"
     CREDS_FILE="$HOME/instalacion-credenciales.txt"
+    VERSION_FILE="$STATE_DIR/version"
 fi
 # Lo escribe el 'late-commands' del autoinstall y es de donde el servicio saca
 # el token al reintentar. Se borra solo al completar con exito.
@@ -180,6 +195,7 @@ CONTROL
   --purge-installer      Borrar la cuenta de rescate y su home (userdel -r) en
                          vez de bloquearla.
   --dry-run              Mostrar la configuración resuelta y salir.
+  --version              Imprimir la versión de este script y salir.
   -h, --help             Esta ayuda.
 
 ENTORNO
@@ -276,6 +292,7 @@ while [ $# -gt 0 ]; do
         --keep-secrets)         KEEP_SECRETS=1 ;;
         --summary-no-secrets)   SUMMARY_NO_SECRETS=1 ;;
         --dry-run)              DRY_RUN=1 ;;
+        --version)              printf 'setup.sh %s (%s)\n' "$VERSION" "$VERSION_SOURCE"; exit 0 ;;
         -h|--help)              usage; exit 0 ;;
         *) usage >&2; die "Opción desconocida: $1" ;;
     esac
@@ -1820,6 +1837,50 @@ svc_state() {
     else echo 'n/d'; fi
 }
 
+# Version realmente instalada de cada componente. Sin esto, la primera pregunta
+# ante cualquier fallo -"que version tienes?"- no tiene respuesta. Ninguna rama
+# puede devolver vacio: una columna en blanco no distingue "no instalado" de
+# "no lo supimos averiguar", y esa diferencia es la que importa al depurar.
+comp_version() {
+    _cv=''
+    case "$1" in
+        docker)
+            have docker || { printf 'no instalado'; return 0; }
+            _cv=$(docker --version 2>/dev/null | sed -n 's/^Docker version \([^,]*\).*/\1/p' | head -n1)
+            ;;
+        coolify)
+            [ -d /data/coolify ] || { printf 'no instalado'; return 0; }
+            # Coolify no expone su version por API sin un usuario creado, asi
+            # que se saca del .env que deja su instalador o de la etiqueta de
+            # la imagen del compose.
+            _cv=$(sed -n 's/^APP_VERSION=//p' /data/coolify/source/.env 2>/dev/null | head -n1)
+            [ -n "$_cv" ] || _cv=$(sed -n 's|.*coollabsio/coolify:\([^ "'"'"']*\).*|\1|p' \
+                /data/coolify/source/docker-compose.yml 2>/dev/null | head -n1)
+            ;;
+        cloudflared)
+            if [ -z "${CLOUDFLARED_BIN:-}" ] || [ ! -x "${CLOUDFLARED_BIN:-}" ]; then
+                printf 'no instalado'; return 0
+            fi
+            _cv=$("$CLOUDFLARED_BIN" --version 2>/dev/null | awk 'NR==1 {print $3}')
+            ;;
+        sistema)
+            _cv=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"' | head -n1)
+            [ -n "$_cv" ] || _cv=$(uname -sr 2>/dev/null || true)
+            ;;
+    esac
+    [ -n "$_cv" ] || _cv=desconocida
+    printf '%s' "$_cv"
+}
+
+version_table() {
+    printf '  Proyecto .......... %s (%s)\n' "$VERSION" "$VERSION_SOURCE"
+    printf '  Sistema base ...... %s\n' "$(comp_version sistema)"
+    printf '  Docker ............ %s\n' "$(comp_version docker)"
+    printf '  Coolify ........... %s\n' "$(comp_version coolify)"
+    printf '  cloudflared ....... %s (pin: %s)\n' "$(comp_version cloudflared)" "$CLOUDFLARED_VERSION"
+    printf '  jq ................ %s (pin, solo si hubo que descargarlo)\n' "$JQ_VERSION"
+}
+
 # El resumen se parte en dos a propósito. Uno se puede enseñar, pegar en un
 # ticket o dejar en pantalla; el otro tiene contraseñas en claro y hay que
 # tratarlo como lo que es.
@@ -1863,6 +1924,9 @@ write_summaries() {
         printf '  El nombre del túnel sale del dominio del panel, no del hostname:\n'
         printf '  reinstalar este equipo reutiliza este mismo túnel. Nada de lo que\n'
         printf '  hay en Cloudflare se borra solo, tampoco con --reset.\n'
+        printf '\nVERSIONES\n'
+        version_table
+        printf '  Tambien en %s (0644)\n' "$VERSION_FILE"
         printf '\nESTADO DE SERVICIOS\n'
         printf '  docker ............ %s\n' "$(svc_state docker)"
         printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
@@ -1905,6 +1969,22 @@ write_summaries() {
         printf '  Contraseña ........ %s\n' "$COOLIFY_PASSWORD"
     } > "$CREDS_FILE"
     chmod 600 "$CREDS_FILE"
+
+    # Clave=valor en vez de prosa: esto lo va a leer un inventario o un grep,
+    # no una persona. No lleva secretos, de ahi el 0644.
+    {
+        printf '# Escrito por setup.sh el %s. Sin secretos: legible por todos.\n' "$(_ts)"
+        printf 'proyecto=%s\n'           "$VERSION"
+        printf 'proyecto_origen=%s\n'    "$VERSION_SOURCE"
+        printf 'sistema=%s\n'            "$(comp_version sistema)"
+        printf 'docker=%s\n'             "$(comp_version docker)"
+        printf 'coolify=%s\n'            "$(comp_version coolify)"
+        printf 'cloudflared=%s\n'        "$(comp_version cloudflared)"
+        printf 'cloudflared_pin=%s\n'    "$CLOUDFLARED_VERSION"
+        printf 'jq_pin=%s\n'             "$JQ_VERSION"
+        printf 'instalado=%s\n'          "$(_ts)"
+    } > "$VERSION_FILE"
+    chmod 644 "$VERSION_FILE"
 }
 
 wipe_secrets() {

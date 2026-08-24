@@ -6,7 +6,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 ## [No publicado]
 
 ### Añadido
-- Suite de pruebas (`tests/run.sh`) con 146 comprobaciones y un simulador de la
+- Suite de pruebas (`tests/run.sh`) con 208 comprobaciones y un simulador de la
   API de Cloudflare.
 - Integración continua: shellcheck en dialecto `sh`, sintaxis en cinco shells,
   la suite completa y comprobaciones de que no se filtran secretos.
@@ -42,6 +42,14 @@ Versionado [semántico](https://semver.org/lang/es/).
   verificación de verdad y qué no.
 
 ### Cambiado
+- **Versionado real** ([#13]). `build-usb.sh` hornea `git describe --tags
+  --always --dirty` en el `user-data`, y llega al destino por el
+  `EnvironmentFile` de la unidad systemd (`SETUP_VERSION=`), no por un marcador
+  dentro de `setup.sh`: el script incrustado tiene que seguir siendo idéntico
+  byte a byte al original. Nuevo `--version` en **ambos** scripts, tabla de
+  versiones en el resumen final y `/etc/coolify-setup.version` (0644, sin
+  secretos). El `EnvironmentFile` se genera ahora en un solo sitio, del que
+  beben tanto el bloque `write_files` como el `/cidata` de la ISO.
 - **`cloudflared` se instala en una versión fija** ([#5]), no desde
   `releases/latest`: la misma ISO tiene que dar el mismo sistema. Nueva
   `--cloudflared-version=X`, que sobrevive al reintento. La URL de `jq` pasa a
@@ -101,3 +109,10 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15
+[#1]: https://github.com/fompi/culificador/issues/1
+[#2]: https://github.com/fompi/culificador/issues/2
+[#3]: https://github.com/fompi/culificador/issues/3
+[#5]: https://github.com/fompi/culificador/issues/5
+[#9]: https://github.com/fompi/culificador/issues/9
+[#12]: https://github.com/fompi/culificador/issues/12
+[#13]: https://github.com/fompi/culificador/issues/13
