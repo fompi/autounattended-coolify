@@ -30,6 +30,15 @@ Versionado [semántico](https://semver.org/lang/es/).
   aborta la instalación y el resumen dice siempre cómo quedó la cuenta.
 
 ### Corregido
+- **El paso `tunnel_service` daba falsos positivos** ([#6]). `systemctl
+  is-active` tras un `sleep 5` no prueba nada: `cloudflared` arranca y
+  reintenta en bucle aunque el token no valga. Ahora se le pregunta a
+  Cloudflare por el estado del túnel hasta verlo `healthy` (o `degraded`, que
+  se acepta avisando), con reintentos y un tiempo máximo configurable con
+  `TUNNEL_HEALTH_TIMEOUT`. Si no conecta, el error distingue las tres causas
+  —sin salida a internet, puerto 7844 bloqueado, token del túnel inválido—, que
+  tienen tres soluciones distintas. Y un `cloudflared` ya activo solo se da por
+  bueno si lleva el token de *este* túnel, no el de un intento anterior.
 - El bloque `late-commands` usaba `install -D`, que es una extensión de GNU.
   Ahora `mkdir -p` + `cp` + `chmod`, para poder ejecutarlo y comprobarlo en
   cualquier POSIX.
@@ -55,7 +64,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 - Plantilla de autoinstall y `build-usb.sh`.
 
 [#1]: https://github.com/fompi/autounattended-coolify/issues/1
-[#1]: https://github.com/fompi/autounattended-coolify/issues/1
 [#3]: https://github.com/fompi/autounattended-coolify/issues/3
+[#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12

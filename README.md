@@ -396,6 +396,16 @@ conserva tal cual, y `--installer-user=NOMBRE` sirve si le pusiste otro nombre.
   los necesita.
 - **Secretos en `ps`.** Un `--cf-token=xxx` literal es visible para otros
   usuarios de la máquina. Usa `@fichero`, `@-` o la variable de entorno.
+- **El túnel se comprueba conectado, no arrancado.** `systemctl is-active` no
+  basta: `cloudflared` arranca y reintenta en bucle aunque el token no valga, así
+  que «activo» no significa «conectado». El paso le pregunta a Cloudflare por el
+  estado del túnel y espera a que sea `healthy` (acepta `degraded` —conecta y pasa
+  tráfico, con menos conexiones al edge de las esperadas— pero avisa). El tiempo
+  máximo son 120 s, ajustables con `TUNNEL_HEALTH_TIMEOUT`. Si no conecta, el
+  mensaje distingue las tres causas, que tienen tres soluciones distintas: sin
+  salida a internet, cortafuegos de salida bloqueando el puerto 7844, o token del
+  túnel que no vale. Si no se puede ni preguntar, avisa y sigue: no conviene
+  inventarse un modo de fallo tardío por no haber podido comprobar nada.
 - **Dominio comodín.** El CNAME `*.app.tudominio.tld` ya está enrutado: al crear
   una app en Coolify le pones un dominio con ese patrón y funciona sin tocar DNS.
 
@@ -416,7 +426,7 @@ detalle, las implicaciones y un esbozo de solución.
 
 | | Qué pasa |
 |---|---|
-| [#6](https://github.com/fompi/autounattended-coolify/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. |
+| [#6](https://github.com/fompi/autounattended-coolify/issues/6) | **El paso `tunnel_service` nunca se ha probado con un túnel real.** Es el último eslabón: sin él no hay nada publicado. La comprobación ya no se conforma con `is-active` —pregunta a Cloudflare si el túnel está conectado, con reintentos y diagnóstico—, pero la conexión al edge real sigue sin ejercitarse. |
 | [#10](https://github.com/fompi/autounattended-coolify/issues/10) | **x86_64 y arranque BIOS sin verificar**, siendo el destino declarado del proyecto. Todo se ha probado en arm64 con UEFI. |
 
 ### Deuda y operación
@@ -490,6 +500,10 @@ Probado ejecutándolo, no solo leyéndolo.
 - Flujo de resolución completo contra una API de Cloudflare simulada:
   descubrimiento de zona, menú multi-zona, derivación de hostname, email y
   zona horaria, creación de túnel, ingress y registros DNS.
+- Espera a que el túnel aparezca conectado: reintenta mientras Cloudflare
+  responde `inactive`, acepta `degraded`, y **falla** si nunca conecta, dentro
+  del tiempo máximo configurado. Lo que no se puede probar aquí es la conexión
+  real de `cloudflared` contra el edge.
 - Precedencia argumentos > configuración guardada > derivado > preguntar.
 - Idempotencia y reintento de pasos.
 - Prompts vía `/dev/tty` con el script canalizado (`curl | sh`).
