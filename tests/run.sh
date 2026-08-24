@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer registro mantenimiento descargas version resolution tunnel build latecommands
+# Grupos: syntax json validators timezone secrets installer registro cortafuegos mantenimiento descargas version resolution tunnel build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
@@ -48,7 +48,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer registro mantenimiento descargas version resolution tunnel build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer registro cortafuegos mantenimiento descargas version resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -291,6 +291,7 @@ fake_config() {
     CONFIG_FILE="$SEC/config.env"
     TUNNEL_FILE="$SEC/tunnel.env"
     STATE_DIR="$SEC/state"
+    FIREWALL_UNIT='/etc/systemd/system/coolify-firewall.service'
     mkdir -p "$STATE_DIR"
 }
 fake_config
@@ -591,6 +592,7 @@ sum_config() {
     VERSION_FILE="$REGS/version"; SETUP_ENV_FILE="$REGS/etc-env"
     SUMMARY_FILE="$REGS/resumen.txt"; CREDS_FILE="$REGS/credenciales.txt"
     CONFIG_FILE="$REGS/config.env"; TUNNEL_FILE="$REGS/tunnel.env"
+    FIREWALL_UNIT='/etc/systemd/system/coolify-firewall.service'
 }
 sum_config
 
@@ -637,6 +639,256 @@ case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
     *--skip-coolify-register*) ok "--skip-coolify-register aparece en la ayuda" ;;
     *) bad "--skip-coolify-register aparece en la ayuda" ;;
 esac
+fi
+
+# ------------------------------------------------------------- cortafuegos
+if want cortafuegos; then
+group "Cortafuegos: ufw y la cadena DOCKER-USER (#4)"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^valid_cidr() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^iface_from_ip_route() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^iface_from_proc_route() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^ssh_client_ip() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^ufw_plan() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^docker_user_plan() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^firewall_script() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^firewall_unit() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_firewall() {/,/^}/p' "$ROOT/setup.sh")"
+note() { :; }
+warn() { :; }
+err()  { :; }
+info() { :; }
+_logfile() { :; }
+need_root() { return 0; }
+
+FW="$TMP/fw"; mkdir -p "$FW"
+# Consumidas por las funciones cargadas con eval, que el analizador no ve.
+# shellcheck disable=SC2034
+LAN_CIDRS='10.0.0.0/8 172.16.0.0/12 192.168.0.0/16'
+SSH_FROM=''; ALLOW_LAN=''; NO_FIREWALL=''
+
+# --- interfaz externa -----------------------------------------------------
+IPR='default via 192.168.1.1 dev enp3s0 proto dhcp src 192.168.1.50 metric 100'
+is "saca la interfaz de 'ip route'" "enp3s0" "$(iface_from_ip_route "$IPR")"
+is "sin ruta por defecto, nada"     ""       "$(iface_from_ip_route '10.0.0.0/8 dev docker0 scope link')"
+is "sin salida de 'ip route', nada" ""       "$(iface_from_ip_route '')"
+printf 'Iface\tDestination\tGateway\tFlags\n' > "$FW/route"
+printf 'docker0\t000011AC\t00000000\t0001\n' >> "$FW/route"
+printf 'eth0\t00000000\t0101A8C0\t0003\n'    >> "$FW/route"
+is "y tambien de /proc/net/route" "eth0" "$(iface_from_proc_route "$FW/route")"
+is "un /proc/net/route que no existe no revienta" "" "$(iface_from_proc_route "$FW/no-existe")"
+
+# --- ufw_plan -------------------------------------------------------------
+PLAN=$(ufw_plan)
+case "$PLAN" in *'ufw default deny incoming'*) ok "deniega la entrada por defecto" ;;
+    *) bad "deniega la entrada por defecto" "$PLAN" ;; esac
+case "$PLAN" in *'ufw default allow outgoing'*) ok "y deja salir" ;;
+    *) bad "y deja salir" ;; esac
+case "$PLAN" in *'ufw allow 22/tcp'*) ok "abre el 22" ;;
+    *) bad "abre el 22" "$PLAN" ;; esac
+# Lo esencial de #4: el tunel SALE hacia Cloudflare, no recibe. Abrir 80 o 8000
+# solo sirve para que la LAN se salte el tunel.
+case "$PLAN" in *8000*) bad "8000 NO se abre sin pedirlo" "$PLAN" ;;
+    *) ok "8000 NO se abre sin pedirlo" ;; esac
+case "$PLAN" in *'port 80'*) bad "80 NO se abre sin pedirlo" "$PLAN" ;;
+    *) ok "80 NO se abre sin pedirlo" ;; esac
+# 'ufw --force reset' tira las conexiones abiertas, la del operador incluida.
+if grep -nE '^[[:space:]]*[^#[:space:]].*--force reset' "$ROOT/setup.sh" > "$TMP/hit" 2>/dev/null; then
+    bad "en ningun sitio se hace 'ufw --force reset'" "$(cat "$TMP/hit")"
+else
+    ok "en ningun sitio se hace 'ufw --force reset'"
+fi
+
+# --allow-lan: entonces si, y para las tres redes privadas.
+ALLOW_LAN=1
+PLAN_LAN=$(ufw_plan)
+n=$(printf '%s\n' "$PLAN_LAN" | grep -c 'port 8000' || true)
+is "--allow-lan abre 8000 a las tres redes privadas" "3" "$n"
+n=$(printf '%s\n' "$PLAN_LAN" | grep -c 'port 80 ' || true)
+is "y 80 igual" "3" "$n"
+ALLOW_LAN=''
+
+# --ssh-from: la IP desde la que se esta ejecutando esto va SIEMPRE. Si no, el
+# operador se autoexpulsa en el mismo comando desde el que esta conectado.
+SSH_FROM='192.168.1.0/24'
+PLAN_SSH=$(SSH_CONNECTION='10.9.9.9 51234 10.0.0.5 22' ufw_plan)
+case "$PLAN_SSH" in *'from 192.168.1.0/24 to any port 22'*) ok "--ssh-from acota el 22" ;;
+    *) bad "--ssh-from acota el 22" "$PLAN_SSH" ;; esac
+case "$PLAN_SSH" in *'from 10.9.9.9 to any port 22'*) ok "y anade la IP de la sesion en curso" ;;
+    *) bad "y anade la IP de la sesion en curso" "$PLAN_SSH" ;; esac
+case "$PLAN_SSH" in *'ufw allow 22/tcp'*) bad "con --ssh-from no queda el 22 abierto a todos" ;;
+    *) ok "con --ssh-from no queda el 22 abierto a todos" ;; esac
+# Tambien vale SSH_CLIENT, que es lo que hay en shells mas viejas.
+PLAN_SSH2=$(SSH_CLIENT='10.8.8.8 51234 22' ufw_plan)
+case "$PLAN_SSH2" in *'from 10.8.8.8 to any port 22'*) ok "SSH_CLIENT sirve igual que SSH_CONNECTION" ;;
+    *) bad "SSH_CLIENT sirve igual que SSH_CONNECTION" "$PLAN_SSH2" ;; esac
+# Basura en SSH_CONNECTION no puede acabar dentro de una regla.
+is "una IP de mentira no se cuela en la regla" "" "$(SSH_CONNECTION='pepe; rm -rf /' ssh_client_ip)"
+# shellcheck disable=SC2034
+SSH_FROM=''
+
+# --- DOCKER-USER ----------------------------------------------------------
+DPLAN=$(docker_user_plan eth0)
+is "la cadena se vacia antes de rehacerla" "iptables -F DOCKER-USER" \
+   "$(printf '%s\n' "$DPLAN" | head -n1)"
+# Sin esto cae el trafico de vuelta de TODO lo que sale del equipo: Coolify no
+# podria ni descargar una imagen.
+l_est=$(printf '%s\n' "$DPLAN" | grep -n 'ESTABLISHED,RELATED' | cut -d: -f1 | head -n1)
+l_drop=$(printf '%s\n' "$DPLAN" | grep -n -- '-j DROP' | cut -d: -f1 | head -n1)
+if [ -n "$l_est" ] && [ -n "$l_drop" ] && [ "$l_est" -lt "$l_drop" ]; then
+    ok "ESTABLISHED,RELATED va ANTES del DROP"
+else
+    bad "ESTABLISHED,RELATED va ANTES del DROP" "established=${l_est:-?} drop=${l_drop:-?}"
+fi
+# Un DROP sin '-i' tira tambien lo que va de los contenedores hacia internet.
+sin_i=$(printf '%s\n' "$DPLAN" | grep -- '-j DROP' | grep -cv -- '-i eth0' || true)
+is "ninguna regla DROP se queda sin '-i'" "0" "$sin_i"
+n=$(printf '%s\n' "$DPLAN" | grep -c -- '-j DROP' || true)
+is "y hay un DROP, no cero" "1" "$n"
+case "$DPLAN" in *'-i lo -j RETURN'*) ok "el loopback se deja pasar" ;;
+    *) bad "el loopback se deja pasar" "$DPLAN" ;; esac
+case "$DPLAN" in *8000*) bad "sin --allow-lan no se abre 8000 a la LAN" "$DPLAN" ;;
+    *) ok "sin --allow-lan no se abre 8000 a la LAN" ;; esac
+
+ALLOW_LAN=1
+DPLAN_LAN=$(docker_user_plan eth0)
+l_lan=$(printf '%s\n' "$DPLAN_LAN" | grep -n 'dport 8000' | cut -d: -f1 | head -n1)
+l_drop=$(printf '%s\n' "$DPLAN_LAN" | grep -n -- '-j DROP' | cut -d: -f1 | head -n1)
+if [ -n "$l_lan" ] && [ "$l_lan" -lt "$l_drop" ]; then
+    ok "con --allow-lan los RETURN de la LAN van antes del DROP"
+else
+    bad "con --allow-lan los RETURN de la LAN van antes del DROP" "lan=${l_lan:-?} drop=${l_drop:-?}"
+fi
+sin_i=$(printf '%s\n' "$DPLAN_LAN" | grep -- '-j DROP' | grep -cv -- '-i eth0' || true)
+is "y el DROP sigue con su '-i'" "0" "$sin_i"
+# shellcheck disable=SC2034
+ALLOW_LAN=''
+
+# --- script y unidad ------------------------------------------------------
+FIREWALL_SCRIPT="$FW/coolify-firewall-docker"
+FIREWALL_UNIT="$FW/coolify-firewall.service"
+firewall_script eth0 > "$FW/fw.sh"
+for sh_ in sh dash bash; do
+    have "$sh_" || continue
+    if $sh_ -n "$FW/fw.sh" 2>/dev/null; then ok "el script de reglas es $sh_ valido"
+    else bad "el script de reglas es $sh_ valido"; fi
+done
+case "$(cat "$FW/fw.sh")" in
+    *'iptables -N DOCKER-USER'*) ok "crea la cadena si no esta" ;;
+    *) bad "crea la cadena si no esta" ;;
+esac
+UNIT=$(firewall_unit)
+for pat in 'After=docker.service' 'Requires=docker.service' 'PartOf=docker.service' \
+           'Type=oneshot'; do
+    case "$UNIT" in *"$pat"*) ok "la unidad lleva $pat" ;;
+        *) bad "la unidad lleva $pat" "$UNIT" ;; esac
+done
+case "$UNIT" in *"ExecStart=$FIREWALL_SCRIPT"*) ok "y apunta al script de reglas" ;;
+    *) bad "y apunta al script de reglas" "$UNIT" ;; esac
+
+# --- do_firewall con ufw e iptables de mentira ----------------------------
+# El riesgo de #4 es cortarse el SSH a uno mismo. Se comprueba ejecutando el
+# paso entero con ordenes simuladas y mirando lo que habria ejecutado.
+FWLOG="$FW/ordenes.log"
+# shellcheck disable=SC2034
+LOG_FILE="$FW/fw-run.log"
+# shellcheck disable=SC2034
+OS_N=linux
+# shellcheck disable=SC2034
+HAS_SYSTEMD=1
+WORK_DIR="$FW/work"; mkdir -p "$WORK_DIR"
+STATE_DIR="$FW/state"; mkdir -p "$STATE_DIR"
+fw_run() {
+    : > "$FWLOG"
+    ( ok() { :; }
+      have() { return 0; }
+      ufw() {
+          printf 'ufw %s\n' "$*" >> "$FWLOG"
+          if [ -n "${UFW_FAIL:-}" ] && [ "$1" = allow ]; then return 1; fi
+          return 0
+      }
+      iptables() { printf 'iptables %s\n' "$*" >> "$FWLOG"; return 0; }
+      systemctl() { printf 'systemctl %s\n' "$*" >> "$FWLOG"; return 0; }
+      firewall_ext_iface() { printf '%s' "${FAKE_IFACE-eth0}"; }
+      do_firewall ) >/dev/null 2>&1
+}
+
+rm -f "$FIREWALL_SCRIPT" "$FIREWALL_UNIT"
+st=0; fw_run || st=$?
+is "el paso completo sale bien" "0" "$st"
+l_allow=$(grep -n 'ufw allow' "$FWLOG" | cut -d: -f1 | tail -n1)
+l_enable=$(grep -n 'ufw --force enable' "$FWLOG" | cut -d: -f1 | head -n1)
+if [ -n "$l_allow" ] && [ -n "$l_enable" ] && [ "$l_allow" -lt "$l_enable" ]; then
+    ok "el 'allow 22' se aplica ANTES del 'enable'"
+else
+    bad "el 'allow 22' se aplica ANTES del 'enable'" "allow=${l_allow:-?} enable=${l_enable:-?}"
+fi
+if [ -f "$FIREWALL_SCRIPT" ] && [ -f "$FIREWALL_UNIT" ]; then
+    ok "deja el script y la unidad que reponen DOCKER-USER"
+else
+    bad "deja el script y la unidad que reponen DOCKER-USER"
+fi
+case "$(state_get firewall)" in *activo*) ok "y el resumen lo puede contar" ;;
+    *) bad "y el resumen lo puede contar" "[$(state_get firewall)]" ;; esac
+
+# Si un 'ufw allow' falla, NO se activa nada: un 'deny incoming' sin la regla de
+# SSH deja fuera a quien esta ejecutando esto, y ya no hay vuelta atras.
+UFW_FAIL=1
+st=0; fw_run || st=$?
+is "si un 'allow' falla, el paso falla" "1" "$st"
+if grep -q 'enable' "$FWLOG"; then
+    bad "y sobre todo NO activa el cortafuegos" "$(cat "$FWLOG")"
+else
+    ok "y sobre todo NO activa el cortafuegos"
+fi
+UFW_FAIL=''
+
+# Sin interfaz externa se FALLA. La alternativa seria un DROP sin '-i', que
+# corta a los contenedores la salida a internet.
+rm -f "$FIREWALL_SCRIPT" "$FIREWALL_UNIT"
+FAKE_IFACE=''
+st=0; fw_run || st=$?
+is "sin saber la interfaz externa, el paso falla" "1" "$st"
+if grep -q 'DROP' "$FWLOG"; then
+    bad "y no instala ninguna regla DROP" "$(cat "$FWLOG")"
+else
+    ok "y no instala ninguna regla DROP"
+fi
+if [ -e "$FIREWALL_SCRIPT" ]; then bad "ni deja el script escrito"; else ok "ni deja el script escrito"; fi
+unset FAKE_IFACE
+
+# --no-firewall: no se toca nada, pero el resumen lo dice bien claro.
+NO_FIREWALL=1
+st=0; fw_run || st=$?
+is "--no-firewall no falla" "0" "$st"
+is "y no ejecuta ni una orden" "" "$(cat "$FWLOG")"
+case "$(state_get firewall)" in *DESACTIVADO*) ok "y el resumen avisa de que no hay cortafuegos" ;;
+    *) bad "y el resumen avisa de que no hay cortafuegos" "[$(state_get firewall)]" ;; esac
+# shellcheck disable=SC2034
+NO_FIREWALL=''
+
+# --- orden de los pasos ---------------------------------------------------
+# docker_config ANTES que firewall porque escribir daemon.json obliga a
+# reiniciar dockerd, y dockerd VACIA y recrea DOCKER-USER al arrancar: al reves
+# las reglas desaparecerian sin decir nada y el cortafuegos quedaria de adorno.
+l_docker=$(grep -n '^run_step docker "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_dcfg=$(grep -n '^run_step docker_config ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_fw=$(grep -n '^run_step firewall ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_coolify=$(grep -n '^run_step coolify "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ "$l_docker" -lt "$l_dcfg" ] && [ "$l_dcfg" -lt "$l_fw" ] && [ "$l_fw" -lt "$l_coolify" ]; then
+    ok "orden docker -> docker_config -> firewall -> coolify"
+else
+    bad "orden docker -> docker_config -> firewall -> coolify" \
+        "docker=$l_docker docker_config=$l_dcfg firewall=$l_fw coolify=$l_coolify"
+fi
+
+for f in --no-firewall --ssh-from --allow-lan; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
 fi
 
 # ----------------------------------------------------------- mantenimiento
@@ -786,8 +1038,11 @@ if [ "$l_tsvc" -lt "$l_upd" ]; then
 else
     bad "los parches van despues del tunel, no antes" "tunnel_service=$l_tsvc updates=$l_upd"
 fi
+# Se cuentan las INVOCACIONES, no las menciones: un err/warn que le dice al
+# usuario que instale algo con apt-get no compite por ningun lock.
 malo=''
-for n in $(grep -n 'apt-get' "$ROOT/setup.sh" | cut -d: -f1); do
+for n in $(grep -n 'apt-get' "$ROOT/setup.sh" \
+           | grep -vE '^[0-9]+:[[:space:]]*(err|warn|note|info|#)' | cut -d: -f1); do
     [ "$n" -gt "$l_tsvc" ] || malo="$malo $n"
 done
 if [ -z "$malo" ]; then
@@ -1465,8 +1720,8 @@ PYEOF
         _sd=$1; shift
         mkdir -p "$_sd/coolify-setup"
         for _st in wifi hostname timezone admin_user docker docker_config \
-                   coolify coolify_domain coolify_register cloudflared_bin \
-                   tunnel_service updates retire_installer; do
+                   firewall coolify coolify_domain coolify_register \
+                   cloudflared_bin tunnel_service updates retire_installer; do
             : > "$_sd/coolify-setup/step.$_st"
         done
         env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$_sd" \

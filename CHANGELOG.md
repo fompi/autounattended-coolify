@@ -30,6 +30,30 @@ Versionado [semántico](https://semver.org/lang/es/).
   aborta la instalación y el resumen dice siempre cómo quedó la cuenta.
 
 ### Seguridad
+- **Cortafuegos, y con la trampa de Docker resuelta** ([#4]). Paso nuevo
+  `firewall`, entre `docker_config` y Coolify: `ufw` con `deny incoming`,
+  `allow outgoing` y solo el 22 abierto. 80 y 8000 se quedan cerrados a
+  propósito —`cloudflared` abre la conexión *hacia* Cloudflare, no recibe
+  nada—, así que la LAN deja de poder saltarse el túnel.
+  Con `ufw` a secas no bastaba: `dockerd` inserta sus reglas en `FORWARD` por
+  delante, y un contenedor con `-p` seguía siendo accesible. `{"iptables":
+  false}` no es la solución (rompe la red de los contenedores); el único gancho
+  soportado es la cadena `DOCKER-USER`, que se rellena con
+  `ESTABLISHED,RELATED → RETURN` **la primera** y un `DROP` que **siempre**
+  lleva `-i <interfaz externa>`: sin ese `-i` también moriría el tráfico
+  contenedor→internet. Si la interfaz externa no se puede determinar, el paso
+  falla en vez de instalar una regla sin `-i`.
+  `DOCKER-USER` la vacía `dockerd` en cada arranque, así que las reglas las
+  repone una unidad `oneshot` con `After`/`Requires`/`PartOf` de
+  `docker.service` —nada de `iptables-persistent`, que arrastra apt y debconf—.
+  Y por eso mismo el paso va **después** de `docker_config`: escribir
+  `daemon.json` obliga a reiniciar `dockerd`, y al revés las reglas
+  desaparecerían en ese reinicio sin decir nada.
+  Sobre no cortarse el SSH a uno mismo: el `allow 22` va siempre antes del
+  `enable`, si falla cualquier `allow` no se activa nada, nunca se hace
+  `ufw --force reset` (tira las conexiones abiertas) y con `--ssh-from=CIDR` se
+  añade además la IP de la sesión en curso, leída de `$SSH_CONNECTION` o
+  `$SSH_CLIENT`. Nuevas `--no-firewall`, `--ssh-from=CIDR` y `--allow-lan`.
 - **Las descargas se verifican contra un SHA-256** ([#2]). `jq` contra el hash
   que publica su release; `cloudflared` contra uno calculado por nosotros —que
   es confianza en el primer uso, no verificación independiente: Cloudflare no
@@ -134,6 +158,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#1]: https://github.com/fompi/autounattended-coolify/issues/1
 [#2]: https://github.com/fompi/autounattended-coolify/issues/2
 [#3]: https://github.com/fompi/autounattended-coolify/issues/3
+[#4]: https://github.com/fompi/autounattended-coolify/issues/4
 [#5]: https://github.com/fompi/autounattended-coolify/issues/5
 [#6]: https://github.com/fompi/autounattended-coolify/issues/6
 [#7]: https://github.com/fompi/autounattended-coolify/issues/7

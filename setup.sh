@@ -66,6 +66,10 @@ DONE_MARKER="$STATE_DIR/completed"
 # probar los pasos sin ser root ni tocar el sistema de verdad.
 DOCKER_DAEMON_JSON=/etc/docker/daemon.json
 UNATTENDED_CONF=/etc/apt/apt.conf.d/51coolify-unattended
+FIREWALL_SCRIPT=/usr/local/sbin/coolify-firewall-docker
+FIREWALL_UNIT=/etc/systemd/system/coolify-firewall.service
+# Redes privadas de la RFC 1918. Solo se usan con --allow-lan.
+LAN_CIDRS='10.0.0.0/8 172.16.0.0/12 192.168.0.0/16'
 
 # ============================================================================
 # Salida y registro
@@ -162,6 +166,15 @@ SISTEMA (todo opcional, todo derivado o generado si se omite)
   --installer-user=NOM   Cuenta de rescate creada por el autoinstall. Por
                          defecto: installer.
 
+CORTAFUEGOS
+  --no-firewall          No configurar cortafuegos. Deja el panel de Coolify y
+                         lo que publiquen los contenedores accesibles desde
+                         toda la red local, saltándose el túnel.
+  --ssh-from=CIDR        Aceptar SSH solo desde esa red. La IP desde la que se
+                         está ejecutando esto se añade siempre, para no
+                         dejarte fuera en el mismo comando.
+  --allow-lan            Abrir 80 y 8000 a las redes privadas, a propósito.
+
 MANTENIMIENTO
   --no-unattended-upgrades  No configurar los parches automáticos de seguridad.
   --auto-reboot=no|HH:MM Reiniciar solo si un parche lo exige, a esa hora.
@@ -240,6 +253,7 @@ NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
 SKIP_COOLIFY_REGISTER=''
 NO_UNATTENDED=''; AUTO_REBOOT=no
+NO_FIREWALL=''; SSH_FROM=''; ALLOW_LAN=''
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 CLOUDFLARED_VERSION=''
@@ -297,6 +311,10 @@ while [ $# -gt 0 ]; do
         --skip-docker)          SKIP_DOCKER=1 ;;
         --skip-coolify)         SKIP_COOLIFY=1 ;;
         --skip-coolify-register) SKIP_COOLIFY_REGISTER=1 ;;
+        --no-firewall)          NO_FIREWALL=1 ;;
+        --ssh-from=*)           SSH_FROM=${1#*=} ;;
+        --ssh-from)             shift; SSH_FROM=$1 ;;
+        --allow-lan)            ALLOW_LAN=1 ;;
         --no-unattended-upgrades) NO_UNATTENDED=1 ;;
         --auto-reboot=*)        AUTO_REBOOT=${1#*=} ;;
         --auto-reboot)          shift; AUTO_REBOOT=$1 ;;
@@ -816,6 +834,14 @@ valid_label() {
 valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
+# Una IP o una red en notación CIDR. Se valida con severidad a propósito: este
+# valor acaba dentro de una orden que se ejecuta con eval, así que lo que no
+# encaje aquí no llega a ninguna parte.
+valid_cidr() {
+    printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' && return 0
+    printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{0,4}){2,7}(/[0-9]{1,3})?$'
+}
+
 # 'no' o una hora HH:MM en 24h. Se valida antes de escribir nada: un valor
 # raro en Automatic-Reboot-Time deja unattended-upgrades sin aplicar parches y
 # sin decir por qué.
@@ -962,7 +988,7 @@ if [ -f "$CONFIG_FILE" ]; then
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
               NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
               WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD \
-              INSTALLER_USER CLOUDFLARED_VERSION \
+              INSTALLER_USER CLOUDFLARED_VERSION SSH_FROM \
               PIN_CLOUDFLARED PIN_DOCKER PIN_COOLIFY OFFLINE_DIR; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
@@ -1184,6 +1210,11 @@ valid_email "$COOLIFY_EMAIL" || die "Email de Coolify no válido: $COOLIFY_EMAIL
 valid_auto_reboot "$AUTO_REBOOT" \
     || die "--auto-reboot: usa 'no' o una hora HH:MM en 24h. Recibido: $AUTO_REBOOT"
 
+if [ -n "$SSH_FROM" ]; then
+    valid_cidr "$SSH_FROM" \
+        || die "--ssh-from: se espera una IP o una red CIDR. Recibido: $SSH_FROM"
+fi
+
 # El nombre acaba en userdel/usermod: se valida antes de acercarlo a nada.
 printf '%s' "$INSTALLER_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_.-]*$' \
     || die "Nombre de cuenta de rescate no válido: $INSTALLER_USER"
@@ -1227,6 +1258,7 @@ COOLIFY_EMAIL='$COOLIFY_EMAIL'
 COOLIFY_PASSWORD='$(printf '%s' "$COOLIFY_PASSWORD" | sed "s/'/'\\\\''/g")'
 INSTALLER_USER='$INSTALLER_USER'
 CLOUDFLARED_VERSION='$CLOUDFLARED_VERSION'
+SSH_FROM='$SSH_FROM'
 PIN_CLOUDFLARED='$PIN_CLOUDFLARED'
 PIN_DOCKER='$PIN_DOCKER'
 PIN_COOLIFY='$PIN_COOLIFY'
@@ -1447,6 +1479,232 @@ do_docker_config() {
     return 0
 }
 run_step docker_config "Límite de logs de Docker" do_docker_config
+
+# --- Cortafuegos ----------------------------------------------------------
+# Sin esto el equipo termina con 22, 80, 8000 y lo que publique cada
+# contenedor abiertos a toda la red local: el túnel deja de ser LA entrada y
+# pasa a ser UNA entrada, con Cloudflare Access decorando una puerta que tiene
+# otra al lado (#4).
+#
+# Va DESPUÉS de docker_config y ANTES de coolify. El orden no es estético:
+# escribir daemon.json obliga a reiniciar dockerd, y al arrancar, dockerd VACÍA
+# y recrea la cadena DOCKER-USER. Al revés, las reglas de aquí desaparecerían en
+# ese reinicio y el cortafuegos quedaría sin efecto sin decir ni una palabra.
+
+# Interfaz de la ruta por defecto a partir de la salida de 'ip route'.
+iface_from_ip_route() {
+    printf '%s\n' "$1" \
+        | awk '/^default/ { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }'
+}
+# Lo mismo leyendo /proc/net/route, para un sistema sin iproute2. La segunda
+# columna a 00000000 es el destino 0.0.0.0, o sea la ruta por defecto.
+iface_from_proc_route() {
+    [ -r "$1" ] || return 0
+    awk 'NR > 1 && $2 == "00000000" { print $1; exit }' "$1"
+}
+firewall_ext_iface() {
+    _fi=''
+    if have ip; then
+        _fi=$(iface_from_ip_route "$(ip -4 route show default 2>/dev/null || true)")
+    fi
+    [ -n "$_fi" ] || _fi=$(iface_from_proc_route /proc/net/route)
+    # El nombre acaba dentro de una orden que se ejecuta con eval: lo que no
+    # parezca un nombre de interfaz no sale de aquí.
+    if printf '%s' "$_fi" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._@-]*$'; then
+        printf '%s' "$_fi"
+    fi
+}
+
+# IP desde la que llega la sesión actual, si viene por SSH.
+ssh_client_ip() {
+    _sc="${SSH_CONNECTION:-}"
+    [ -n "$_sc" ] || _sc="${SSH_CLIENT:-}"
+    [ -n "$_sc" ] || return 0
+    _si=$(printf '%s' "$_sc" | awk '{print $1}')
+    if valid_cidr "$_si"; then printf '%s' "$_si"; fi
+}
+
+# La política de ufw, una orden por línea. Imprime en vez de ejecutar: así la
+# suite puede comprobar QUÉ se abre sin ufw, sin iptables y sin ser root, y el
+# paso puede pararse en seco si una sola de las órdenes falla.
+ufw_plan() {
+    printf 'ufw default deny incoming\n'
+    printf 'ufw default allow outgoing\n'
+    # SSH SIEMPRE, y siempre antes del enable.
+    if [ -n "$SSH_FROM" ]; then
+        printf 'ufw allow from %s to any port 22 proto tcp\n' "$SSH_FROM"
+        # Y siempre, además, la IP desde la que se está ejecutando esto: con un
+        # --ssh-from mal calculado el operador se autoexpulsaría en el mismo
+        # comando desde el que está conectado, sin forma de volver a entrar.
+        _me=$(ssh_client_ip)
+        if [ -n "$_me" ] && [ "$_me" != "$SSH_FROM" ]; then
+            printf 'ufw allow from %s to any port 22 proto tcp\n' "$_me"
+        fi
+    else
+        printf 'ufw allow 22/tcp\n'
+    fi
+    # 80 y 8000 NO se abren: cloudflared abre la conexión HACIA Cloudflare, no
+    # recibe nada de fuera. Abrirlos solo sirve para saltarse el túnel.
+    if [ -n "$ALLOW_LAN" ]; then
+        for _n in $LAN_CIDRS; do
+            printf 'ufw allow from %s to any port 80 proto tcp\n' "$_n"
+            printf 'ufw allow from %s to any port 8000 proto tcp\n' "$_n"
+        done
+    fi
+}
+
+# Las reglas de la cadena DOCKER-USER, una por línea.
+#
+# Existe porque ufw NO filtra los puertos que publica Docker: dockerd mete sus
+# propias reglas en FORWARD por delante de las de ufw, así que un contenedor con
+# -p 8080:80 es accesible aunque ufw diga que no. Poner {"iptables": false} en
+# daemon.json tampoco vale: eso rompe la red de los contenedores. El único
+# gancho que Docker soporta es DOCKER-USER, que consulta antes que las suyas.
+#
+# docker_user_plan INTERFAZ_EXTERNA
+docker_user_plan() {
+    _df=$1
+    printf 'iptables -F DOCKER-USER\n'
+    # ESTABLISHED,RELATED la PRIMERA, sin discusión: es el tráfico de vuelta de
+    # todo lo que sale del equipo. Detrás del DROP, Coolify no podría ni
+    # descargar una imagen.
+    printf 'iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n'
+    printf 'iptables -A DOCKER-USER -i lo -j RETURN\n'
+    if [ -n "$ALLOW_LAN" ]; then
+        for _n in $LAN_CIDRS; do
+            printf 'iptables -A DOCKER-USER -i %s -s %s -p tcp --dport 80 -j RETURN\n' "$_df" "$_n"
+            printf 'iptables -A DOCKER-USER -i %s -s %s -p tcp --dport 8000 -j RETURN\n' "$_df" "$_n"
+        done
+    fi
+    # El -i es OBLIGATORIO. Un DROP sin -i tira también lo que va de los
+    # contenedores hacia internet, que entra por docker0/br-*, y deja el equipo
+    # sin poder descargar nada.
+    printf 'iptables -A DOCKER-USER -i %s -j DROP\n' "$_df"
+    printf 'iptables -A DOCKER-USER -j RETURN\n'
+}
+
+# El script que reaplica DOCKER-USER en cada arranque de dockerd. Hace falta
+# porque dockerd vacía y recrea esa cadena al arrancar: sin esto las reglas
+# durarían hasta el primer reinicio y nadie se enteraría. No se usa
+# iptables-persistent a propósito: arrastra apt y debconf, y esto tiene que
+# funcionar sin que nadie conteste a nada.
+firewall_script() {
+    printf '#!/bin/sh\n'
+    printf '# Generado por setup.sh (#4). NO editar: se reescribe al reejecutar.\n'
+    printf '# dockerd vacia y recrea DOCKER-USER en cada arranque; esto la repone.\n'
+    printf 'set -eu\n'
+    printf 'iptables -nL DOCKER-USER >/dev/null 2>&1 || iptables -N DOCKER-USER\n'
+    docker_user_plan "$1"
+}
+
+firewall_unit() {
+    printf '[Unit]\n'
+    printf 'Description=Reglas DOCKER-USER de coolify-setup\n'
+    printf 'After=docker.service\n'
+    printf 'Requires=docker.service\n'
+    # PartOf es la pieza clave: hace que un 'systemctl restart docker' arrastre
+    # esta unidad detrás. Sin ella, reiniciar Docker deja el equipo abierto.
+    printf 'PartOf=docker.service\n'
+    printf '\n[Service]\n'
+    printf 'Type=oneshot\n'
+    printf 'RemainAfterExit=yes\n'
+    printf 'ExecStart=%s\n' "$FIREWALL_SCRIPT"
+    printf '\n[Install]\n'
+    printf 'WantedBy=multi-user.target\n'
+}
+
+do_firewall() {
+    if [ -n "$NO_FIREWALL" ]; then
+        warn "Cortafuegos desactivado por --no-firewall."
+        warn "El panel y lo que publiquen los contenedores quedan accesibles desde"
+        warn "toda la red local, saltándose el túnel y Cloudflare Access."
+        state_set firewall 'DESACTIVADO por --no-firewall'
+        state_set firewall_ssh 'sin filtrar'
+        state_set firewall_lan 'todo lo que escuche es accesible en la LAN'
+        return 0
+    fi
+    need_root || return 1
+    if [ "$OS_N" != linux ]; then
+        warn "El cortafuegos solo está automatizado en Linux; se omite."
+        state_set firewall 'omitido (solo automatizado en Linux)'
+        return 0
+    fi
+    have ufw || {
+        err "ufw no está instalado y es lo que se usa para la política de entrada."
+        err "Instálalo (apt-get install ufw) o reejecuta con --no-firewall."
+        return 1
+    }
+    have iptables || {
+        err "iptables no está disponible y sin él no se puede tocar DOCKER-USER,"
+        err "que es lo único que filtra los puertos publicados por Docker."
+        return 1
+    }
+
+    _ext=$(firewall_ext_iface)
+    if [ -z "$_ext" ]; then
+        err "No se ha podido determinar la interfaz externa (la de la ruta por defecto)."
+        err "Sin ella la regla de DOCKER-USER iría sin '-i', y un DROP sin '-i' corta"
+        err "también el tráfico de los contenedores hacia internet: Coolify no podría"
+        err "ni descargar una imagen. Se prefiere fallar aquí a instalar esa regla."
+        err "Arregla la ruta por defecto o reejecuta con --no-firewall."
+        return 1
+    fi
+
+    # El orden NO es negociable: primero TODAS las reglas, el enable al final.
+    # Si una sola falla no se activa nada, porque activar un 'deny incoming' sin
+    # la regla de SSH deja fuera a quien está ejecutando esto y ya no hay vuelta
+    # atrás. Y en ningún momento un 'ufw --force reset': eso tira las conexiones
+    # abiertas, la actual incluida.
+    _plan="$WORK_DIR/ufw.plan"
+    ufw_plan > "$_plan" || return 1
+    while IFS= read -r _cmd; do
+        [ -n "$_cmd" ] || continue
+        _logfile "cortafuegos: $_cmd"
+        if ! eval "$_cmd" >>"$LOG_FILE" 2>&1; then
+            err "Falló: $_cmd"
+            err "NO se activa el cortafuegos: hacerlo sin esa regla puede dejarte fuera."
+            return 1
+        fi
+    done < "$_plan"
+    ufw --force enable >>"$LOG_FILE" 2>&1 || { err "'ufw enable' falló."; return 1; }
+    ok "ufw activo: entra 22/tcp, nada más"
+
+    mkdir -p "$(dirname "$FIREWALL_SCRIPT")" || return 1
+    firewall_script "$_ext" > "$FIREWALL_SCRIPT" || return 1
+    chmod 755 "$FIREWALL_SCRIPT"
+    if [ -n "$HAS_SYSTEMD" ]; then
+        mkdir -p "$(dirname "$FIREWALL_UNIT")" || return 1
+        firewall_unit > "$FIREWALL_UNIT" || return 1
+        chmod 644 "$FIREWALL_UNIT"
+        _unit=$(basename "$FIREWALL_UNIT")
+        systemctl daemon-reload >>"$LOG_FILE" 2>&1 || return 1
+        systemctl enable --now "$_unit" >>"$LOG_FILE" 2>&1 || {
+            err "No se pudieron aplicar las reglas de DOCKER-USER ($_unit)."
+            err "Mira: journalctl -u $_unit -n 50 --no-pager"
+            return 1
+        }
+    else
+        warn "Sin systemd las reglas se aplican ahora, pero dockerd las borrará en el"
+        warn "próximo arranque. Ejecuta $FIREWALL_SCRIPT tras cada reinicio."
+        sh "$FIREWALL_SCRIPT" >>"$LOG_FILE" 2>&1 \
+            || { err "No se pudieron aplicar las reglas de DOCKER-USER."; return 1; }
+    fi
+
+    state_set firewall "activo (ufw + DOCKER-USER en $_ext)"
+    if [ -n "$SSH_FROM" ]; then
+        _me=$(ssh_client_ip)
+        state_set firewall_ssh "22/tcp desde $SSH_FROM${_me:+ y desde $_me}"
+    else
+        state_set firewall_ssh '22/tcp desde cualquier sitio'
+    fi
+    if [ -n "$ALLOW_LAN" ]; then
+        state_set firewall_lan 'ABIERTA: 80 y 8000 accesibles en la red local (--allow-lan)'
+    else
+        state_set firewall_lan 'cerrada: 80 y 8000 solo por el túnel'
+    fi
+    return 0
+}
+run_step firewall "Cortafuegos" do_firewall
 
 # --- Coolify --------------------------------------------------------------
 wait_for_http() {
@@ -2167,6 +2425,13 @@ write_summaries() {
         printf '\nVERSIONES\n'
         version_table
         printf '  Tambien en %s (0644)\n' "$VERSION_FILE"
+        printf '\nCORTAFUEGOS\n'
+        printf '  Estado ............ %s\n' "$(state_get firewall 'sin configurar')"
+        printf '  Entrada SSH ....... %s\n' "$(state_get firewall_ssh 'n/d')"
+        printf '  Red local ......... %s\n' "$(state_get firewall_lan 'n/d')"
+        printf '  Los puertos que publican los contenedores NO los filtra ufw: van\n'
+        printf '  por la cadena DOCKER-USER, que %s repone en cada\n' "$(basename "$FIREWALL_UNIT")"
+        printf '  arranque de dockerd porque Docker la borra al arrancar.\n'
         printf '\nMANTENIMIENTO\n'
         printf '  Logs de Docker .... %s\n' "$(state_get docker_logs 'sin configurar')"
         printf '  Actualizaciones ... %s\n' "$(state_get updates 'sin configurar')"

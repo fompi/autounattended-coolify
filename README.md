@@ -456,7 +456,7 @@ detalle, las implicaciones y un esbozo de solución.
 | | Qué pasa |
 |---|---|
 | [#2](https://github.com/fompi/autounattended-coolify/issues/2) | **Verificación de descargas incompleta.** `jq` y `cloudflared` sí se comprueban contra un SHA-256, pero el de `cloudflared` lo calculamos nosotros (Cloudflare no publica hashes): es confianza en el primer uso, no verificación independiente. El script de Docker y el de Coolify **no se verifican** salvo que los fijes con `--pin-docker` / `--pin-coolify`. Detalle en `SECURITY.md`. |
-| [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Sin cortafuegos.** El panel de Coolify (8000) y el proxy (80) quedan accesibles desde toda la red local, saltándose el túnel. |
+| [#4](https://github.com/fompi/autounattended-coolify/issues/4) | **Cortafuegos sin probar contra una LAN real.** Ya se configura `ufw` (solo entra el 22) y la cadena `DOCKER-USER`, que es lo único que filtra los puertos que publica Docker; lo que falta es el `nmap` desde otra máquina que lo confirme. Banderas: `--no-firewall`, `--ssh-from=CIDR`, `--allow-lan`. |
 | [#8](https://github.com/fompi/autounattended-coolify/issues/8) | *Resuelto.* `build-usb.sh` comprueba la ISO de entrada (ISO9660, edición, arquitectura, tamaño y contenido) y sabe verificar hash y firma con `--iso-sha256` / `--verify-iso`. Sigue sin ser obligatorio: quien no lo pida, no verifica. |
 
 ### Sin verificar
@@ -477,11 +477,10 @@ detalle, las implicaciones y un esbozo de solución.
 | [#15](https://github.com/fompi/autounattended-coolify/issues/15) | Reejecutar deja túneles huérfanos en Cloudflare. |
 
 **Si vas a usarlo en serio**, lo mínimo antes es fijar Docker y Coolify con
-`--pin-docker` / `--pin-coolify` ([#2](https://github.com/fompi/autounattended-coolify/issues/2)),
-[#4](https://github.com/fompi/autounattended-coolify/issues/4) y
-[#6](https://github.com/fompi/autounattended-coolify/issues/6): integridad de lo que se
-instala, no quedar expuesto en la LAN, y comprobar que el túnel levanta de
-verdad.
+`--pin-docker` / `--pin-coolify` ([#2](https://github.com/fompi/autounattended-coolify/issues/2))
+y comprobar con un `nmap` desde otra máquina de la red que el cortafuegos hace
+lo que dice ([#4](https://github.com/fompi/autounattended-coolify/issues/4)) y que el
+túnel levanta de verdad ([#6](https://github.com/fompi/autounattended-coolify/issues/6)).
 
 ## Qué está verificado y qué no
 
