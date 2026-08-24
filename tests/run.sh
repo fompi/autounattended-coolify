@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer descargas version resolution tunnel build latecommands
+# Grupos: syntax json validators timezone secrets installer registro descargas version resolution tunnel build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
@@ -48,7 +48,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer descargas version resolution tunnel build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer registro descargas version resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -231,6 +231,8 @@ fi
 if want secrets; then
 group "Secretos: borrado, resumen partido y orden de #3"
 eval "$(sed -n '/^wipe_file() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^comp_version() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^version_table() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
@@ -266,7 +268,6 @@ fake_config() {
     COOLIFY_FQDN='coolify.fompi.net'
     COOLIFY_EMAIL='a@b.com'
     COOLIFY_PASSWORD='CLAVECOOLIFY456'
-    COOLIFY_REGISTERED=1
     SKIP_COOLIFY=''
     APP_SUBDOMAIN='app'
     ROOT_DOMAIN='fompi.net'
@@ -289,8 +290,11 @@ fake_config() {
     CREDS_FILE="$SEC/credenciales.txt"
     CONFIG_FILE="$SEC/config.env"
     TUNNEL_FILE="$SEC/tunnel.env"
+    STATE_DIR="$SEC/state"
+    mkdir -p "$STATE_DIR"
 }
 fake_config
+state_set coolify_register registrado
 
 write_summaries
 if grep -q 'CLAVEADMIN123\|CLAVECOOLIFY456' "$SUMMARY_FILE"; then
@@ -461,6 +465,178 @@ for f in --keep-rescue --purge-installer --installer-user; do
         *) bad "$f aparece en la ayuda" ;;
     esac
 done
+fi
+
+# ---------------------------------------------------------------- registro
+if want registro; then
+group "Registro del primer usuario de Coolify (#7)"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^register_form_offered() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_coolify_register() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^comp_version() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^version_table() {/,/^}/p' "$ROOT/setup.sh")"
+note() { :; }
+warn() { :; }
+_ts() { echo '2026-01-01 00:00:00'; }
+svc_state() { echo activo; }
+
+# El formulario de registro y el de login. Los DOS llevan name="_token": ese
+# era justo el error, dar por bueno cualquier pagina que lo tuviera.
+FORM_REG='<form action="/register" method="POST"><input name="_token" value="TOK123"><input name="email"><input name="password"><input name="password_confirmation"></form>'
+FORM_LOGIN='<form action="/login" method="POST"><input name="_token" value="TOK999"><input name="email"><input name="password"></form>'
+FORM_REG_ERR='<div>El email ya esta en uso</div>'"$FORM_REG"
+
+chk_form() { # chk_form descripcion html esperado(0|1)
+    if register_form_offered "$2"; then got=0; else got=1; fi
+    if [ "$got" = "$3" ]; then ok "$1"; else bad "$1" "esperaba rc=$3"; fi
+}
+chk_form "reconoce el formulario de registro"     "$FORM_REG"       0
+chk_form "el login NO cuela como registro"        "$FORM_LOGIN"     1
+chk_form "una respuesta vacia no es formulario"   ""                1
+chk_form "un redirect sin cuerpo tampoco"         '<html></html>'   1
+chk_form "el formulario con errores sigue siendolo" "$FORM_REG_ERR" 0
+
+# --- do_coolify_register contra un curl de mentira ------------------------
+# Se simula la conversacion entera: GET /register, POST, y el GET de
+# comprobacion. Asi se prueba la deteccion de exito de verdad, que es lo que
+# denuncia #7, y no que el texto del script mencione una URL.
+REGD="$TMP/reg"
+curl() {
+    _out=''; _prev=''
+    for _a in "$@"; do
+        [ "$_prev" = "-o" ] && _out=$_a
+        _prev=$_a
+    done
+    _n=$(cat "$REGD/n" 2>/dev/null || echo 0); _n=$((_n+1)); printf '%s\n' "$_n" > "$REGD/n"
+    if [ -n "$_out" ]; then
+        cat "$REGD/resp.$_n" > "$_out" 2>/dev/null || :
+        cat "$REGD/code" 2>/dev/null || printf '200'
+    else
+        cat "$REGD/resp.$_n" 2>/dev/null || :
+    fi
+    return 0
+}
+# Consumidas por do_coolify_register, cargada con eval: el analizador no lo ve.
+# shellcheck disable=SC2034
+UA='pruebas'
+# shellcheck disable=SC2034
+ADMIN_USER='admin'
+# shellcheck disable=SC2034
+COOLIFY_EMAIL='a@b.com'
+# shellcheck disable=SC2034
+COOLIFY_PASSWORD='CLAVECOOLIFY456'
+# shellcheck disable=SC2034
+HTTP='curl'
+
+# reg_run CODIGO_POST HTML_1 HTML_3 -> deja el estado en $STATE_DIR
+reg_run() {
+    rm -rf "$REGD"; mkdir -p "$REGD"
+    printf '%s' "$1" > "$REGD/code"
+    printf '%s' "$2" > "$REGD/resp.1"
+    printf '%s' "$3" > "$REGD/resp.3"
+    rm -f "$STATE_DIR/state.coolify_register"
+    # En subshell y con 'ok' anulada: do_coolify_register llama a ok() y aqui
+    # esa funcion es el contador de pruebas. El estado viaja por disco.
+    ( ok() { :; }; do_coolify_register ) >/dev/null 2>&1
+}
+STATE_DIR="$TMP/reg-state"; mkdir -p "$STATE_DIR"
+WORK_DIR="$TMP/reg-work";   mkdir -p "$WORK_DIR"
+SKIP_COOLIFY=''
+SKIP_COOLIFY_REGISTER=''
+
+# El caso que denuncia #7: 200 con el formulario devuelto y errores dentro.
+reg_run 200 "$FORM_REG" "$FORM_REG_ERR"
+is "un 200 con el formulario devuelto NO es exito" "pendiente" "$(state_get coolify_register)"
+
+# Exito de verdad: /register deja de ofrecer formulario.
+reg_run 200 "$FORM_REG" "$FORM_LOGIN"
+is "un 200 con /register ya cerrado si es exito" "registrado" "$(state_get coolify_register)"
+
+# 302 con el formulario todavia en pie: tampoco vale.
+reg_run 302 "$FORM_REG" "$FORM_REG"
+is "ni un 302 si el formulario sigue ahi" "pendiente" "$(state_get coolify_register)"
+
+# Ya habia usuario: ni se intenta, y se distingue de "pendiente".
+reg_run 200 "$FORM_LOGIN" "$FORM_LOGIN"
+is "si ya hay usuario lo dice, no lo confunde con pendiente" "ya-existia" "$(state_get coolify_register)"
+
+# Sin poder releer /register no se afirma nada.
+reg_run 200 "$FORM_REG" ""
+is "sin comprobacion posible, pendiente" "pendiente" "$(state_get coolify_register)"
+
+SKIP_COOLIFY_REGISTER=1
+reg_run 200 "$FORM_REG" "$FORM_LOGIN"
+is "--skip-coolify-register no registra nada" "omitido" "$(state_get coolify_register)"
+# shellcheck disable=SC2034
+SKIP_COOLIFY_REGISTER=''
+unset -f curl
+
+# --- el resumen distingue los tres estados (mas el omitido) ---------------
+REGS="$TMP/reg-sum"; mkdir -p "$REGS"
+# Consumidas por write_summaries, cargada con eval.
+# shellcheck disable=SC2034
+sum_config() {
+    NEW_HOSTNAME='maquina'; TIMEZONE='Europe/Madrid'; TIMEZONE_SOURCE='sistema'
+    ADMIN_USER='admin'; ADMIN_PASSWORD='CLAVEADMIN123'; SSH_KEY=''
+    COOLIFY_FQDN='coolify.fompi.net'; COOLIFY_EMAIL='a@b.com'
+    COOLIFY_PASSWORD='CLAVECOOLIFY456'; SKIP_COOLIFY=''
+    APP_SUBDOMAIN='app'; ROOT_DOMAIN='fompi.net'; APP_WILDCARD='*.app.fompi.net'
+    TUNNEL_ID='tid'; TUNNEL_NAME='coolify-coolify.fompi.net'
+    INSTALLER_USER='installer'; INSTALLER_STATE='bloqueada'
+    LOG_FILE="$REGS/log"; IS_ROOT=''; KEEP_SECRETS=''
+    VERSION='1.0-prueba'; VERSION_SOURCE='literal'; CLOUDFLARED_VERSION='2026.8.2'
+    JQ_VERSION='1.7.1'; CLOUDFLARED_BIN=''
+    VERSION_FILE="$REGS/version"; SETUP_ENV_FILE="$REGS/etc-env"
+    SUMMARY_FILE="$REGS/resumen.txt"; CREDS_FILE="$REGS/credenciales.txt"
+    CONFIG_FILE="$REGS/config.env"; TUNNEL_FILE="$REGS/tunnel.env"
+}
+sum_config
+
+sum_says() { # sum_says estado patron descripcion
+    state_set coolify_register "$1"
+    write_summaries
+    case "$(cat "$SUMMARY_FILE")" in
+        *"$2"*) ok "$3" ;;
+        *) bad "$3" "$(grep -n 'Estado' "$SUMMARY_FILE" | head -3)" ;;
+    esac
+}
+sum_says registrado 'usuario registrado y comprobado' "el resumen dice 'registrado'"
+sum_says ya-existia 'YA EXISTIA un usuario'           "el resumen dice 'ya existia'"
+sum_says pendiente  'PENDIENTE'                       "el resumen dice 'pendiente'"
+sum_says omitido    'omitido (--skip-coolify-register)' "el resumen dice 'omitido'"
+
+# Regresion de la trampa de #7: en un reintento run_step NO reejecuta el paso,
+# asi que cualquier variable en memoria esta vacia. Si el resumen se fiara de
+# ella, diria "PENDIENTE" de un usuario que si se registro.
+state_set coolify_register registrado
+COOLIFY_REGISTERED=''   # la variable de antes, deliberadamente vacia
+write_summaries
+case "$(cat "$SUMMARY_FILE")" in
+    *PENDIENTE*) bad "en un reintento el resumen no miente" "dice PENDIENTE de un usuario registrado" ;;
+    *'usuario registrado y comprobado'*) ok "en un reintento el resumen no miente" ;;
+    *) bad "en un reintento el resumen no miente" "estado inesperado" ;;
+esac
+unset COOLIFY_REGISTERED
+
+# El estado tiene que sobrevivir al proceso: es lo unico que run_step no repite.
+if [ -f "$STATE_DIR/state.coolify_register" ]; then
+    ok "el estado del registro queda en disco, no en una variable"
+else
+    bad "el estado del registro queda en disco, no en una variable"
+fi
+
+# Guardian: que no vuelva el "cualquier 2xx/3xx es exito".
+if grep -nE '^\s*302\|200\|303\)' "$ROOT/setup.sh" > "$TMP/hit" 2>/dev/null; then
+    bad "el exito ya no se decide por el codigo HTTP" "$(cat "$TMP/hit")"
+else
+    ok "el exito ya no se decide por el codigo HTTP"
+fi
+case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+    *--skip-coolify-register*) ok "--skip-coolify-register aparece en la ayuda" ;;
+    *) bad "--skip-coolify-register aparece en la ayuda" ;;
+esac
 fi
 
 # --------------------------------------------------------------- descargas

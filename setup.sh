@@ -181,6 +181,8 @@ CONTROL
   --non-interactive      Fallar en vez de preguntar si falta algún dato.
   --skip-docker          No instalar Docker.
   --skip-coolify         No instalar Coolify.
+  --skip-coolify-register  No registrar el primer usuario de Coolify. El
+                         registro queda pendiente de hacer a mano.
   --skip-tunnel          No crear el túnel de Cloudflare.
   --reset                Olvidar el estado LOCAL y empezar de cero. No toca
                          nada en Cloudflare: el túnel y los CNAME siguen ahí y
@@ -227,6 +229,7 @@ COOLIFY_EMAIL=''; COOLIFY_PASSWORD=''
 ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
 NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
+SKIP_COOLIFY_REGISTER=''
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 CLOUDFLARED_VERSION=''
@@ -283,6 +286,7 @@ while [ $# -gt 0 ]; do
         --no-geoip)             NO_GEOIP=1 ;;
         --skip-docker)          SKIP_DOCKER=1 ;;
         --skip-coolify)         SKIP_COOLIFY=1 ;;
+        --skip-coolify-register) SKIP_COOLIFY_REGISTER=1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
         --reset)                DO_RESET=1 ;;
         --installer-user=*)     INSTALLER_USER=${1#*=} ;;
@@ -890,6 +894,20 @@ gen_password() {
 step_done() { [ -f "$STATE_DIR/step.$1" ]; }
 step_mark() { touch "$STATE_DIR/step.$1"; }
 
+# Estado de un paso, guardado en disco. Hace falta porque run_step NO ejecuta la
+# funcion si el paso ya estaba marcado como hecho: una variable en memoria se
+# queda vacia en el reintento y el resumen acabaria mintiendo sobre lo que de
+# verdad paso (#7). El disco es la unica memoria que sobrevive entre intentos.
+state_set() { printf '%s\n' "$2" > "$STATE_DIR/state.$1"; }
+# state_get NOMBRE [POR_DEFECTO]
+state_get() {
+    if [ -f "$STATE_DIR/state.$1" ]; then
+        head -n1 "$STATE_DIR/state.$1"
+    else
+        printf '%s\n' "${2:-}"
+    fi
+}
+
 # run_step NOMBRE DESCRIPCION funcion
 run_step() {
     _sname=$1; _sdesc=$2; _sfn=$3
@@ -1394,9 +1412,35 @@ run_step coolify_domain "Dominio del panel -> $COOLIFY_FQDN" do_coolify_domain
 # Registro del primer usuario. Coolify no expone API para esto (el token de API
 # se genera desde la UI, después de existir un usuario), así que se automatiza
 # el formulario público /register. Si falla, se deja indicado en el resumen.
-COOLIFY_REGISTERED=''
+#
+# El estado va a disco (state_set), NO a una variable: run_step no reejecuta un
+# paso ya hecho, y en un reintento una variable en memoria quedaría vacía y el
+# resumen diría "pendiente" de un usuario que sí se registró (#7).
+# Valores: registrado | ya-existia | pendiente | omitido
+
+# Cierto si ese HTML es el formulario de REGISTRO de Coolify.
+# No basta con buscar 'name="_token"': el formulario de login lleva uno igual, y
+# tras crear el primer usuario Coolify manda justo ahí. El campo que solo existe
+# en el registro es password_confirmation, así que se exigen los dos.
+register_form_offered() {
+    case "$1" in
+        *'name="_token"'*) : ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *password_confirmation*) return 0 ;;
+    esac
+    return 1
+}
+
 do_coolify_register() {
-    [ -n "$SKIP_COOLIFY" ] && return 0
+    [ -n "$SKIP_COOLIFY" ] && { state_set coolify_register omitido; return 0; }
+    if [ -n "$SKIP_COOLIFY_REGISTER" ]; then
+        note "omitido por --skip-coolify-register"
+        state_set coolify_register omitido
+        return 0
+    fi
+    state_set coolify_register pendiente
     if [ "$HTTP" != curl ]; then
         warn "El registro automático del primer usuario necesita curl; hazlo manualmente."
         return 0
@@ -1407,11 +1451,13 @@ do_coolify_register() {
         warn "No se pudo abrir /register; regístrate manualmente."; return 0; }
 
     # Si Coolify ya tiene usuario, /register redirige o no muestra el formulario.
-    case "$page" in
-        *'name="_token"'*) : ;;
-        *) warn "Coolify no muestra el formulario de registro (¿ya hay un usuario?). Regístrate manualmente."
-           return 0 ;;
-    esac
+    if ! register_form_offered "$page"; then
+        state_set coolify_register ya-existia
+        warn "Coolify no muestra el formulario de registro: ya hay un usuario creado."
+        note "Se conserva el que hay; entra con sus credenciales, no con las de este fichero."
+        rm -f "$jar"
+        return 0
+    fi
     token=$(printf '%s' "$page" | sed -n 's/.*name="_token"[^>]*value="\([^"]*\)".*/\1/p' | head -n1)
     [ -n "$token" ] || token=$(printf '%s' "$page" | sed -n 's/.*value="\([^"]*\)"[^>]*name="_token".*/\1/p' | head -n1)
     [ -n "$token" ] || { warn "No se pudo extraer el token CSRF; regístrate manualmente."; return 0; }
@@ -1425,17 +1471,29 @@ do_coolify_register() {
         --data-urlencode "password_confirmation=$COOLIFY_PASSWORD" \
         "http://localhost:8000/register" 2>/dev/null) || code=000
 
-    case "$code" in
-        302|200|303)
-            COOLIFY_REGISTERED=1
-            ok "Primer usuario de Coolify registrado ($COOLIFY_EMAIL)"
-            ;;
-        *)
-            warn "El registro automático devolvió HTTP $code; tendrás que registrarte a mano."
-            _logfile "Respuesta de registro guardada en $WORK_DIR/register-response.html"
-            ;;
-    esac
+    # El código HTTP no dice la verdad: Laravel devuelve 200 con el formulario
+    # otra vez y los errores de validación pintados dentro. Dar por bueno un 200
+    # es exactamente el fallo de #7. La única comprobación que no miente es
+    # volver a pedir /register: Coolify lo cierra en cuanto existe un usuario,
+    # así que si sigue ofreciendo el formulario, no se registró nadie.
+    # -L a propósito: si redirige a /login, lo que llega es el login, que no
+    # tiene password_confirmation y por tanto cuenta como "ya no hay registro".
+    after=$(curl -sS -L -b "$jar" -A "$UA" "http://localhost:8000/register" 2>/dev/null) || after=''
     rm -f "$jar"
+    if [ -z "$after" ]; then
+        warn "No se pudo releer /register para comprobar el registro (HTTP $code del POST)."
+        note "Queda como PENDIENTE a propósito: sin comprobar, no se afirma."
+        return 0
+    fi
+    if register_form_offered "$after"; then
+        warn "El registro automático NO cuajó: /register sigue ofreciendo el formulario"
+        warn "(el POST devolvió HTTP $code, que por sí solo no significa nada)."
+        note "Respuesta guardada en $WORK_DIR/register-response.html"
+        note "Regístrate a mano con el email y la contraseña del fichero de credenciales."
+        return 0
+    fi
+    state_set coolify_register registrado
+    ok "Primer usuario de Coolify registrado y COMPROBADO ($COOLIFY_EMAIL)"
     return 0
 }
 run_step coolify_register "Primer usuario de Coolify" do_coolify_register
@@ -1905,13 +1963,30 @@ write_summaries() {
         printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
         printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
         printf '  Contraseña ........ en %s\n' "$CREDS_FILE"
-        if [ -n "$COOLIFY_REGISTERED" ]; then
-            printf '  Estado ............ usuario registrado, listo para entrar\n'
-        elif [ -z "$SKIP_COOLIFY" ]; then
-            printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
-            printf '                      el email y contraseña de las credenciales\n'
-            printf '                      (el primer usuario registrado es el propietario).\n'
-        fi
+        # Tres estados de verdad, leidos del disco y no de una variable: en un
+        # reintento el paso no se reejecuta y la variable estaria vacia (#7).
+        case "$(state_get coolify_register pendiente)" in
+            registrado)
+                printf '  Estado ............ usuario registrado y comprobado, listo para entrar\n'
+                ;;
+            ya-existia)
+                printf '  Estado ............ YA EXISTIA un usuario: no se ha tocado\n'
+                printf '                      Entra con las credenciales de ese usuario; la\n'
+                printf '                      contraseña de este fichero no es la suya.\n'
+                ;;
+            omitido)
+                if [ -n "$SKIP_COOLIFY" ]; then
+                    printf '  Estado ............ omitido (--skip-coolify)\n'
+                else
+                    printf '  Estado ............ omitido (--skip-coolify-register): registrate a mano\n'
+                fi
+                ;;
+            *)
+                printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
+                printf '                      el email y contraseña de las credenciales\n'
+                printf '                      (el primer usuario registrado es el propietario).\n'
+                ;;
+        esac
         printf '\nAPPS\n'
         printf '  Patrón de dominio . https://<lo-que-sea>.%s.%s\n' "$APP_SUBDOMAIN" "$ROOT_DOMAIN"
         printf '  Al crear una app en Coolify, ponle un dominio con ese patrón:\n'

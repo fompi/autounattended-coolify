@@ -56,6 +56,18 @@ Versionado [semántico](https://semver.org/lang/es/).
   componerse con la misma constante de versión.
 
 ### Corregido
+- **El registro del primer usuario de Coolify daba éxitos falsos** ([#7]). Se
+  daba por bueno cualquier 200, 302 o 303, y un 200 es justo el caso del
+  formulario devuelto con errores de validación pintados dentro. Ahora, tras el
+  POST, se vuelve a pedir `/register`: Coolify lo cierra en cuanto existe el
+  primer usuario, así que si sigue ofreciendo el formulario es que no se
+  registró nadie. Distinguir el formulario de registro del de login exige
+  `password_confirmation`, porque `name="_token"` lo llevan los dos. El resumen
+  pasa de dos estados a cuatro —registrado, ya existía, pendiente y omitido—, y
+  el estado va a `$STATE_DIR`, no a una variable en memoria: `run_step` no
+  reejecuta un paso ya hecho, así que en un reintento la variable estaba vacía y
+  el resumen decía «pendiente» de un usuario que sí se había registrado. Nueva
+  `--skip-coolify-register`.
 - **Reejecutar dejaba túneles huérfanos en Cloudflare** ([#15]). El nombre del
   túnel era `coolify-$HOSTNAME`, así que reinstalar el equipo con otro hostname
   creaba uno nuevo y abandonaba el viejo apuntando a una máquina que ya no
@@ -106,6 +118,7 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#3]: https://github.com/fompi/autounattended-coolify/issues/3
 [#5]: https://github.com/fompi/autounattended-coolify/issues/5
 [#6]: https://github.com/fompi/autounattended-coolify/issues/6
+[#7]: https://github.com/fompi/autounattended-coolify/issues/7
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15
