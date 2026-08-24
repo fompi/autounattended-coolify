@@ -165,11 +165,5 @@ Versionado [semántico](https://semver.org/lang/es/).
 [#9]: https://github.com/fompi/autounattended-coolify/issues/9
 [#11]: https://github.com/fompi/autounattended-coolify/issues/11
 [#12]: https://github.com/fompi/autounattended-coolify/issues/12
+[#13]: https://github.com/fompi/autounattended-coolify/issues/13
 [#15]: https://github.com/fompi/autounattended-coolify/issues/15
-[#1]: https://github.com/fompi/culificador/issues/1
-[#2]: https://github.com/fompi/culificador/issues/2
-[#3]: https://github.com/fompi/culificador/issues/3
-[#5]: https://github.com/fompi/culificador/issues/5
-[#9]: https://github.com/fompi/culificador/issues/9
-[#12]: https://github.com/fompi/culificador/issues/12
-[#13]: https://github.com/fompi/culificador/issues/13
