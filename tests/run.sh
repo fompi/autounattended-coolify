@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets installer descargas version resolution tunnel build latecommands
+# Grupos: syntax json validators timezone secrets installer registro cortafuegos mantenimiento descargas version resolution tunnel build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y la conexion real de cloudflared contra el edge de Cloudflare. Lo
@@ -48,7 +48,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets installer descargas version resolution tunnel build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer registro cortafuegos mantenimiento descargas version resolution tunnel build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -231,6 +231,8 @@ fi
 if want secrets; then
 group "Secretos: borrado, resumen partido y orden de #3"
 eval "$(sed -n '/^wipe_file() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^comp_version() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^version_table() {/,/^}/p' "$ROOT/setup.sh")"
 eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
@@ -266,7 +268,6 @@ fake_config() {
     COOLIFY_FQDN='coolify.fompi.net'
     COOLIFY_EMAIL='a@b.com'
     COOLIFY_PASSWORD='CLAVECOOLIFY456'
-    COOLIFY_REGISTERED=1
     SKIP_COOLIFY=''
     APP_SUBDOMAIN='app'
     ROOT_DOMAIN='fompi.net'
@@ -289,8 +290,12 @@ fake_config() {
     CREDS_FILE="$SEC/credenciales.txt"
     CONFIG_FILE="$SEC/config.env"
     TUNNEL_FILE="$SEC/tunnel.env"
+    STATE_DIR="$SEC/state"
+    FIREWALL_UNIT='/etc/systemd/system/coolify-firewall.service'
+    mkdir -p "$STATE_DIR"
 }
 fake_config
+state_set coolify_register registrado
 
 write_summaries
 if grep -q 'CLAVEADMIN123\|CLAVECOOLIFY456' "$SUMMARY_FILE"; then
@@ -456,6 +461,597 @@ else
 fi
 
 for f in --keep-rescue --purge-installer --installer-user; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
+# ---------------------------------------------------------------- registro
+if want registro; then
+group "Registro del primer usuario de Coolify (#7)"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^register_form_offered() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_coolify_register() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^write_summaries() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^comp_version() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^version_table() {/,/^}/p' "$ROOT/setup.sh")"
+note() { :; }
+warn() { :; }
+_ts() { echo '2026-01-01 00:00:00'; }
+svc_state() { echo activo; }
+
+# El formulario de registro y el de login. Los DOS llevan name="_token": ese
+# era justo el error, dar por bueno cualquier pagina que lo tuviera.
+FORM_REG='<form action="/register" method="POST"><input name="_token" value="TOK123"><input name="email"><input name="password"><input name="password_confirmation"></form>'
+FORM_LOGIN='<form action="/login" method="POST"><input name="_token" value="TOK999"><input name="email"><input name="password"></form>'
+FORM_REG_ERR='<div>El email ya esta en uso</div>'"$FORM_REG"
+
+chk_form() { # chk_form descripcion html esperado(0|1)
+    if register_form_offered "$2"; then got=0; else got=1; fi
+    if [ "$got" = "$3" ]; then ok "$1"; else bad "$1" "esperaba rc=$3"; fi
+}
+chk_form "reconoce el formulario de registro"     "$FORM_REG"       0
+chk_form "el login NO cuela como registro"        "$FORM_LOGIN"     1
+chk_form "una respuesta vacia no es formulario"   ""                1
+chk_form "un redirect sin cuerpo tampoco"         '<html></html>'   1
+chk_form "el formulario con errores sigue siendolo" "$FORM_REG_ERR" 0
+
+# --- do_coolify_register contra un curl de mentira ------------------------
+# Se simula la conversacion entera: GET /register, POST, y el GET de
+# comprobacion. Asi se prueba la deteccion de exito de verdad, que es lo que
+# denuncia #7, y no que el texto del script mencione una URL.
+REGD="$TMP/reg"
+curl() {
+    _out=''; _prev=''
+    for _a in "$@"; do
+        [ "$_prev" = "-o" ] && _out=$_a
+        _prev=$_a
+    done
+    _n=$(cat "$REGD/n" 2>/dev/null || echo 0); _n=$((_n+1)); printf '%s\n' "$_n" > "$REGD/n"
+    if [ -n "$_out" ]; then
+        cat "$REGD/resp.$_n" > "$_out" 2>/dev/null || :
+        cat "$REGD/code" 2>/dev/null || printf '200'
+    else
+        cat "$REGD/resp.$_n" 2>/dev/null || :
+    fi
+    return 0
+}
+# Consumidas por do_coolify_register, cargada con eval: el analizador no lo ve.
+# shellcheck disable=SC2034
+UA='pruebas'
+# shellcheck disable=SC2034
+ADMIN_USER='admin'
+# shellcheck disable=SC2034
+COOLIFY_EMAIL='a@b.com'
+# shellcheck disable=SC2034
+COOLIFY_PASSWORD='CLAVECOOLIFY456'
+# shellcheck disable=SC2034
+HTTP='curl'
+
+# reg_run CODIGO_POST HTML_1 HTML_3 -> deja el estado en $STATE_DIR
+reg_run() {
+    rm -rf "$REGD"; mkdir -p "$REGD"
+    printf '%s' "$1" > "$REGD/code"
+    printf '%s' "$2" > "$REGD/resp.1"
+    printf '%s' "$3" > "$REGD/resp.3"
+    rm -f "$STATE_DIR/state.coolify_register"
+    # En subshell y con 'ok' anulada: do_coolify_register llama a ok() y aqui
+    # esa funcion es el contador de pruebas. El estado viaja por disco.
+    ( ok() { :; }; do_coolify_register ) >/dev/null 2>&1
+}
+STATE_DIR="$TMP/reg-state"; mkdir -p "$STATE_DIR"
+WORK_DIR="$TMP/reg-work";   mkdir -p "$WORK_DIR"
+SKIP_COOLIFY=''
+SKIP_COOLIFY_REGISTER=''
+
+# El caso que denuncia #7: 200 con el formulario devuelto y errores dentro.
+reg_run 200 "$FORM_REG" "$FORM_REG_ERR"
+is "un 200 con el formulario devuelto NO es exito" "pendiente" "$(state_get coolify_register)"
+
+# Exito de verdad: /register deja de ofrecer formulario.
+reg_run 200 "$FORM_REG" "$FORM_LOGIN"
+is "un 200 con /register ya cerrado si es exito" "registrado" "$(state_get coolify_register)"
+
+# 302 con el formulario todavia en pie: tampoco vale.
+reg_run 302 "$FORM_REG" "$FORM_REG"
+is "ni un 302 si el formulario sigue ahi" "pendiente" "$(state_get coolify_register)"
+
+# Ya habia usuario: ni se intenta, y se distingue de "pendiente".
+reg_run 200 "$FORM_LOGIN" "$FORM_LOGIN"
+is "si ya hay usuario lo dice, no lo confunde con pendiente" "ya-existia" "$(state_get coolify_register)"
+
+# Sin poder releer /register no se afirma nada.
+reg_run 200 "$FORM_REG" ""
+is "sin comprobacion posible, pendiente" "pendiente" "$(state_get coolify_register)"
+
+SKIP_COOLIFY_REGISTER=1
+reg_run 200 "$FORM_REG" "$FORM_LOGIN"
+is "--skip-coolify-register no registra nada" "omitido" "$(state_get coolify_register)"
+# shellcheck disable=SC2034
+SKIP_COOLIFY_REGISTER=''
+unset -f curl
+
+# --- el resumen distingue los tres estados (mas el omitido) ---------------
+REGS="$TMP/reg-sum"; mkdir -p "$REGS"
+# Consumidas por write_summaries, cargada con eval.
+# shellcheck disable=SC2034
+sum_config() {
+    NEW_HOSTNAME='maquina'; TIMEZONE='Europe/Madrid'; TIMEZONE_SOURCE='sistema'
+    ADMIN_USER='admin'; ADMIN_PASSWORD='CLAVEADMIN123'; SSH_KEY=''
+    COOLIFY_FQDN='coolify.fompi.net'; COOLIFY_EMAIL='a@b.com'
+    COOLIFY_PASSWORD='CLAVECOOLIFY456'; SKIP_COOLIFY=''
+    APP_SUBDOMAIN='app'; ROOT_DOMAIN='fompi.net'; APP_WILDCARD='*.app.fompi.net'
+    TUNNEL_ID='tid'; TUNNEL_NAME='coolify-coolify.fompi.net'
+    INSTALLER_USER='installer'; INSTALLER_STATE='bloqueada'
+    LOG_FILE="$REGS/log"; IS_ROOT=''; KEEP_SECRETS=''
+    VERSION='1.0-prueba'; VERSION_SOURCE='literal'; CLOUDFLARED_VERSION='2026.8.2'
+    JQ_VERSION='1.7.1'; CLOUDFLARED_BIN=''
+    VERSION_FILE="$REGS/version"; SETUP_ENV_FILE="$REGS/etc-env"
+    SUMMARY_FILE="$REGS/resumen.txt"; CREDS_FILE="$REGS/credenciales.txt"
+    CONFIG_FILE="$REGS/config.env"; TUNNEL_FILE="$REGS/tunnel.env"
+    FIREWALL_UNIT='/etc/systemd/system/coolify-firewall.service'
+}
+sum_config
+
+sum_says() { # sum_says estado patron descripcion
+    state_set coolify_register "$1"
+    write_summaries
+    case "$(cat "$SUMMARY_FILE")" in
+        *"$2"*) ok "$3" ;;
+        *) bad "$3" "$(grep -n 'Estado' "$SUMMARY_FILE" | head -3)" ;;
+    esac
+}
+sum_says registrado 'usuario registrado y comprobado' "el resumen dice 'registrado'"
+sum_says ya-existia 'YA EXISTIA un usuario'           "el resumen dice 'ya existia'"
+sum_says pendiente  'PENDIENTE'                       "el resumen dice 'pendiente'"
+sum_says omitido    'omitido (--skip-coolify-register)' "el resumen dice 'omitido'"
+
+# Regresion de la trampa de #7: en un reintento run_step NO reejecuta el paso,
+# asi que cualquier variable en memoria esta vacia. Si el resumen se fiara de
+# ella, diria "PENDIENTE" de un usuario que si se registro.
+state_set coolify_register registrado
+COOLIFY_REGISTERED=''   # la variable de antes, deliberadamente vacia
+write_summaries
+case "$(cat "$SUMMARY_FILE")" in
+    *PENDIENTE*) bad "en un reintento el resumen no miente" "dice PENDIENTE de un usuario registrado" ;;
+    *'usuario registrado y comprobado'*) ok "en un reintento el resumen no miente" ;;
+    *) bad "en un reintento el resumen no miente" "estado inesperado" ;;
+esac
+unset COOLIFY_REGISTERED
+
+# El estado tiene que sobrevivir al proceso: es lo unico que run_step no repite.
+if [ -f "$STATE_DIR/state.coolify_register" ]; then
+    ok "el estado del registro queda en disco, no en una variable"
+else
+    bad "el estado del registro queda en disco, no en una variable"
+fi
+
+# Guardian: que no vuelva el "cualquier 2xx/3xx es exito".
+if grep -nE '^\s*302\|200\|303\)' "$ROOT/setup.sh" > "$TMP/hit" 2>/dev/null; then
+    bad "el exito ya no se decide por el codigo HTTP" "$(cat "$TMP/hit")"
+else
+    ok "el exito ya no se decide por el codigo HTTP"
+fi
+case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+    *--skip-coolify-register*) ok "--skip-coolify-register aparece en la ayuda" ;;
+    *) bad "--skip-coolify-register aparece en la ayuda" ;;
+esac
+fi
+
+# ------------------------------------------------------------- cortafuegos
+if want cortafuegos; then
+group "Cortafuegos: ufw y la cadena DOCKER-USER (#4)"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^valid_cidr() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^iface_from_ip_route() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^iface_from_proc_route() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^ssh_client_ip() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^ufw_plan() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^docker_user_plan() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^firewall_script() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^firewall_unit() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_firewall() {/,/^}/p' "$ROOT/setup.sh")"
+note() { :; }
+warn() { :; }
+err()  { :; }
+info() { :; }
+_logfile() { :; }
+need_root() { return 0; }
+
+FW="$TMP/fw"; mkdir -p "$FW"
+# Consumidas por las funciones cargadas con eval, que el analizador no ve.
+# shellcheck disable=SC2034
+LAN_CIDRS='10.0.0.0/8 172.16.0.0/12 192.168.0.0/16'
+SSH_FROM=''; ALLOW_LAN=''; NO_FIREWALL=''
+
+# --- interfaz externa -----------------------------------------------------
+IPR='default via 192.168.1.1 dev enp3s0 proto dhcp src 192.168.1.50 metric 100'
+is "saca la interfaz de 'ip route'" "enp3s0" "$(iface_from_ip_route "$IPR")"
+is "sin ruta por defecto, nada"     ""       "$(iface_from_ip_route '10.0.0.0/8 dev docker0 scope link')"
+is "sin salida de 'ip route', nada" ""       "$(iface_from_ip_route '')"
+printf 'Iface\tDestination\tGateway\tFlags\n' > "$FW/route"
+printf 'docker0\t000011AC\t00000000\t0001\n' >> "$FW/route"
+printf 'eth0\t00000000\t0101A8C0\t0003\n'    >> "$FW/route"
+is "y tambien de /proc/net/route" "eth0" "$(iface_from_proc_route "$FW/route")"
+is "un /proc/net/route que no existe no revienta" "" "$(iface_from_proc_route "$FW/no-existe")"
+
+# --- ufw_plan -------------------------------------------------------------
+PLAN=$(ufw_plan)
+case "$PLAN" in *'ufw default deny incoming'*) ok "deniega la entrada por defecto" ;;
+    *) bad "deniega la entrada por defecto" "$PLAN" ;; esac
+case "$PLAN" in *'ufw default allow outgoing'*) ok "y deja salir" ;;
+    *) bad "y deja salir" ;; esac
+case "$PLAN" in *'ufw allow 22/tcp'*) ok "abre el 22" ;;
+    *) bad "abre el 22" "$PLAN" ;; esac
+# Lo esencial de #4: el tunel SALE hacia Cloudflare, no recibe. Abrir 80 o 8000
+# solo sirve para que la LAN se salte el tunel.
+case "$PLAN" in *8000*) bad "8000 NO se abre sin pedirlo" "$PLAN" ;;
+    *) ok "8000 NO se abre sin pedirlo" ;; esac
+case "$PLAN" in *'port 80'*) bad "80 NO se abre sin pedirlo" "$PLAN" ;;
+    *) ok "80 NO se abre sin pedirlo" ;; esac
+# 'ufw --force reset' tira las conexiones abiertas, la del operador incluida.
+if grep -nE '^[[:space:]]*[^#[:space:]].*--force reset' "$ROOT/setup.sh" > "$TMP/hit" 2>/dev/null; then
+    bad "en ningun sitio se hace 'ufw --force reset'" "$(cat "$TMP/hit")"
+else
+    ok "en ningun sitio se hace 'ufw --force reset'"
+fi
+
+# --allow-lan: entonces si, y para las tres redes privadas.
+ALLOW_LAN=1
+PLAN_LAN=$(ufw_plan)
+n=$(printf '%s\n' "$PLAN_LAN" | grep -c 'port 8000' || true)
+is "--allow-lan abre 8000 a las tres redes privadas" "3" "$n"
+n=$(printf '%s\n' "$PLAN_LAN" | grep -c 'port 80 ' || true)
+is "y 80 igual" "3" "$n"
+ALLOW_LAN=''
+
+# --ssh-from: la IP desde la que se esta ejecutando esto va SIEMPRE. Si no, el
+# operador se autoexpulsa en el mismo comando desde el que esta conectado.
+SSH_FROM='192.168.1.0/24'
+PLAN_SSH=$(SSH_CONNECTION='10.9.9.9 51234 10.0.0.5 22' ufw_plan)
+case "$PLAN_SSH" in *'from 192.168.1.0/24 to any port 22'*) ok "--ssh-from acota el 22" ;;
+    *) bad "--ssh-from acota el 22" "$PLAN_SSH" ;; esac
+case "$PLAN_SSH" in *'from 10.9.9.9 to any port 22'*) ok "y anade la IP de la sesion en curso" ;;
+    *) bad "y anade la IP de la sesion en curso" "$PLAN_SSH" ;; esac
+case "$PLAN_SSH" in *'ufw allow 22/tcp'*) bad "con --ssh-from no queda el 22 abierto a todos" ;;
+    *) ok "con --ssh-from no queda el 22 abierto a todos" ;; esac
+# Tambien vale SSH_CLIENT, que es lo que hay en shells mas viejas.
+PLAN_SSH2=$(SSH_CLIENT='10.8.8.8 51234 22' ufw_plan)
+case "$PLAN_SSH2" in *'from 10.8.8.8 to any port 22'*) ok "SSH_CLIENT sirve igual que SSH_CONNECTION" ;;
+    *) bad "SSH_CLIENT sirve igual que SSH_CONNECTION" "$PLAN_SSH2" ;; esac
+# Basura en SSH_CONNECTION no puede acabar dentro de una regla.
+is "una IP de mentira no se cuela en la regla" "" "$(SSH_CONNECTION='pepe; rm -rf /' ssh_client_ip)"
+# shellcheck disable=SC2034
+SSH_FROM=''
+
+# --- DOCKER-USER ----------------------------------------------------------
+DPLAN=$(docker_user_plan eth0)
+is "la cadena se vacia antes de rehacerla" "iptables -F DOCKER-USER" \
+   "$(printf '%s\n' "$DPLAN" | head -n1)"
+# Sin esto cae el trafico de vuelta de TODO lo que sale del equipo: Coolify no
+# podria ni descargar una imagen.
+l_est=$(printf '%s\n' "$DPLAN" | grep -n 'ESTABLISHED,RELATED' | cut -d: -f1 | head -n1)
+l_drop=$(printf '%s\n' "$DPLAN" | grep -n -- '-j DROP' | cut -d: -f1 | head -n1)
+if [ -n "$l_est" ] && [ -n "$l_drop" ] && [ "$l_est" -lt "$l_drop" ]; then
+    ok "ESTABLISHED,RELATED va ANTES del DROP"
+else
+    bad "ESTABLISHED,RELATED va ANTES del DROP" "established=${l_est:-?} drop=${l_drop:-?}"
+fi
+# Un DROP sin '-i' tira tambien lo que va de los contenedores hacia internet.
+sin_i=$(printf '%s\n' "$DPLAN" | grep -- '-j DROP' | grep -cv -- '-i eth0' || true)
+is "ninguna regla DROP se queda sin '-i'" "0" "$sin_i"
+n=$(printf '%s\n' "$DPLAN" | grep -c -- '-j DROP' || true)
+is "y hay un DROP, no cero" "1" "$n"
+case "$DPLAN" in *'-i lo -j RETURN'*) ok "el loopback se deja pasar" ;;
+    *) bad "el loopback se deja pasar" "$DPLAN" ;; esac
+case "$DPLAN" in *8000*) bad "sin --allow-lan no se abre 8000 a la LAN" "$DPLAN" ;;
+    *) ok "sin --allow-lan no se abre 8000 a la LAN" ;; esac
+
+ALLOW_LAN=1
+DPLAN_LAN=$(docker_user_plan eth0)
+l_lan=$(printf '%s\n' "$DPLAN_LAN" | grep -n 'dport 8000' | cut -d: -f1 | head -n1)
+l_drop=$(printf '%s\n' "$DPLAN_LAN" | grep -n -- '-j DROP' | cut -d: -f1 | head -n1)
+if [ -n "$l_lan" ] && [ "$l_lan" -lt "$l_drop" ]; then
+    ok "con --allow-lan los RETURN de la LAN van antes del DROP"
+else
+    bad "con --allow-lan los RETURN de la LAN van antes del DROP" "lan=${l_lan:-?} drop=${l_drop:-?}"
+fi
+sin_i=$(printf '%s\n' "$DPLAN_LAN" | grep -- '-j DROP' | grep -cv -- '-i eth0' || true)
+is "y el DROP sigue con su '-i'" "0" "$sin_i"
+# shellcheck disable=SC2034
+ALLOW_LAN=''
+
+# --- script y unidad ------------------------------------------------------
+FIREWALL_SCRIPT="$FW/coolify-firewall-docker"
+FIREWALL_UNIT="$FW/coolify-firewall.service"
+firewall_script eth0 > "$FW/fw.sh"
+for sh_ in sh dash bash; do
+    have "$sh_" || continue
+    if $sh_ -n "$FW/fw.sh" 2>/dev/null; then ok "el script de reglas es $sh_ valido"
+    else bad "el script de reglas es $sh_ valido"; fi
+done
+case "$(cat "$FW/fw.sh")" in
+    *'iptables -N DOCKER-USER'*) ok "crea la cadena si no esta" ;;
+    *) bad "crea la cadena si no esta" ;;
+esac
+UNIT=$(firewall_unit)
+for pat in 'After=docker.service' 'Requires=docker.service' 'PartOf=docker.service' \
+           'Type=oneshot'; do
+    case "$UNIT" in *"$pat"*) ok "la unidad lleva $pat" ;;
+        *) bad "la unidad lleva $pat" "$UNIT" ;; esac
+done
+case "$UNIT" in *"ExecStart=$FIREWALL_SCRIPT"*) ok "y apunta al script de reglas" ;;
+    *) bad "y apunta al script de reglas" "$UNIT" ;; esac
+
+# --- do_firewall con ufw e iptables de mentira ----------------------------
+# El riesgo de #4 es cortarse el SSH a uno mismo. Se comprueba ejecutando el
+# paso entero con ordenes simuladas y mirando lo que habria ejecutado.
+FWLOG="$FW/ordenes.log"
+# shellcheck disable=SC2034
+LOG_FILE="$FW/fw-run.log"
+# shellcheck disable=SC2034
+OS_N=linux
+# shellcheck disable=SC2034
+HAS_SYSTEMD=1
+WORK_DIR="$FW/work"; mkdir -p "$WORK_DIR"
+STATE_DIR="$FW/state"; mkdir -p "$STATE_DIR"
+fw_run() {
+    : > "$FWLOG"
+    ( ok() { :; }
+      have() { return 0; }
+      ufw() {
+          printf 'ufw %s\n' "$*" >> "$FWLOG"
+          if [ -n "${UFW_FAIL:-}" ] && [ "$1" = allow ]; then return 1; fi
+          return 0
+      }
+      iptables() { printf 'iptables %s\n' "$*" >> "$FWLOG"; return 0; }
+      systemctl() { printf 'systemctl %s\n' "$*" >> "$FWLOG"; return 0; }
+      firewall_ext_iface() { printf '%s' "${FAKE_IFACE-eth0}"; }
+      do_firewall ) >/dev/null 2>&1
+}
+
+rm -f "$FIREWALL_SCRIPT" "$FIREWALL_UNIT"
+st=0; fw_run || st=$?
+is "el paso completo sale bien" "0" "$st"
+l_allow=$(grep -n 'ufw allow' "$FWLOG" | cut -d: -f1 | tail -n1)
+l_enable=$(grep -n 'ufw --force enable' "$FWLOG" | cut -d: -f1 | head -n1)
+if [ -n "$l_allow" ] && [ -n "$l_enable" ] && [ "$l_allow" -lt "$l_enable" ]; then
+    ok "el 'allow 22' se aplica ANTES del 'enable'"
+else
+    bad "el 'allow 22' se aplica ANTES del 'enable'" "allow=${l_allow:-?} enable=${l_enable:-?}"
+fi
+if [ -f "$FIREWALL_SCRIPT" ] && [ -f "$FIREWALL_UNIT" ]; then
+    ok "deja el script y la unidad que reponen DOCKER-USER"
+else
+    bad "deja el script y la unidad que reponen DOCKER-USER"
+fi
+case "$(state_get firewall)" in *activo*) ok "y el resumen lo puede contar" ;;
+    *) bad "y el resumen lo puede contar" "[$(state_get firewall)]" ;; esac
+
+# Si un 'ufw allow' falla, NO se activa nada: un 'deny incoming' sin la regla de
+# SSH deja fuera a quien esta ejecutando esto, y ya no hay vuelta atras.
+UFW_FAIL=1
+st=0; fw_run || st=$?
+is "si un 'allow' falla, el paso falla" "1" "$st"
+if grep -q 'enable' "$FWLOG"; then
+    bad "y sobre todo NO activa el cortafuegos" "$(cat "$FWLOG")"
+else
+    ok "y sobre todo NO activa el cortafuegos"
+fi
+UFW_FAIL=''
+
+# Sin interfaz externa se FALLA. La alternativa seria un DROP sin '-i', que
+# corta a los contenedores la salida a internet.
+rm -f "$FIREWALL_SCRIPT" "$FIREWALL_UNIT"
+FAKE_IFACE=''
+st=0; fw_run || st=$?
+is "sin saber la interfaz externa, el paso falla" "1" "$st"
+if grep -q 'DROP' "$FWLOG"; then
+    bad "y no instala ninguna regla DROP" "$(cat "$FWLOG")"
+else
+    ok "y no instala ninguna regla DROP"
+fi
+if [ -e "$FIREWALL_SCRIPT" ]; then bad "ni deja el script escrito"; else ok "ni deja el script escrito"; fi
+unset FAKE_IFACE
+
+# --no-firewall: no se toca nada, pero el resumen lo dice bien claro.
+NO_FIREWALL=1
+st=0; fw_run || st=$?
+is "--no-firewall no falla" "0" "$st"
+is "y no ejecuta ni una orden" "" "$(cat "$FWLOG")"
+case "$(state_get firewall)" in *DESACTIVADO*) ok "y el resumen avisa de que no hay cortafuegos" ;;
+    *) bad "y el resumen avisa de que no hay cortafuegos" "[$(state_get firewall)]" ;; esac
+# shellcheck disable=SC2034
+NO_FIREWALL=''
+
+# --- orden de los pasos ---------------------------------------------------
+# docker_config ANTES que firewall porque escribir daemon.json obliga a
+# reiniciar dockerd, y dockerd VACIA y recrea DOCKER-USER al arrancar: al reves
+# las reglas desaparecerian sin decir nada y el cortafuegos quedaria de adorno.
+l_docker=$(grep -n '^run_step docker "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_dcfg=$(grep -n '^run_step docker_config ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_fw=$(grep -n '^run_step firewall ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_coolify=$(grep -n '^run_step coolify "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ "$l_docker" -lt "$l_dcfg" ] && [ "$l_dcfg" -lt "$l_fw" ] && [ "$l_fw" -lt "$l_coolify" ]; then
+    ok "orden docker -> docker_config -> firewall -> coolify"
+else
+    bad "orden docker -> docker_config -> firewall -> coolify" \
+        "docker=$l_docker docker_config=$l_dcfg firewall=$l_fw coolify=$l_coolify"
+fi
+
+for f in --no-firewall --ssh-from --allow-lan; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
+# ----------------------------------------------------------- mantenimiento
+if want mantenimiento; then
+group "Mantenimiento: logs de Docker y parches de seguridad (#11)"
+eval "$(sed -n '/^state_set() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^state_get() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^valid_auto_reboot() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^docker_daemon_json() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^unattended_conf() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_docker_config() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^do_updates() {/,/^}/p' "$ROOT/setup.sh")"
+note() { :; }
+warn() { :; }
+err()  { :; }
+info() { :; }
+need_root() { return 0; }
+
+MNT="$TMP/mnt"; mkdir -p "$MNT"
+STATE_DIR="$MNT/state"; mkdir -p "$STATE_DIR"
+
+# --- daemon.json ----------------------------------------------------------
+if have python3; then
+    if docker_daemon_json | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+        ok "daemon.json es JSON valido"
+    else
+        bad "daemon.json es JSON valido" "$(docker_daemon_json)"
+    fi
+    v=$(docker_daemon_json | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(d["log-driver"], d["log-opts"]["max-size"], d["log-opts"]["max-file"])' 2>/dev/null || echo ERROR)
+    is "con json-file, 10m y 3 ficheros" "json-file 10m 3" "$v"
+else
+    skip "daemon.json es JSON valido" "hace falta python3"
+fi
+
+# --- do_docker_config -----------------------------------------------------
+# Se ejecuta en subshell con 'ok' y 'have' anuladas: 'ok' aqui es el contador
+# de pruebas, y 'have docker' dispararia un 'docker info' de verdad. El estado
+# viaja por disco, asi que el subshell no estorba.
+dcfg() { ( ok() { :; }; have() { return 1; }; do_docker_config ) >/dev/null 2>&1; }
+# Consumidas por do_docker_config, cargada con eval: el analizador no lo ve.
+# shellcheck disable=SC2034
+SKIP_DOCKER=''
+# shellcheck disable=SC2034
+HAS_SYSTEMD=''
+DOCKER_DAEMON_JSON="$MNT/etc/docker/daemon.json"
+
+rm -f "$STATE_DIR/state.docker_logs"
+st=0; dcfg || st=$?
+is "escribe daemon.json si no habia" "0" "$st"
+if [ -f "$DOCKER_DAEMON_JSON" ]; then ok "el fichero queda escrito"; else bad "el fichero queda escrito"; fi
+case "$(state_get docker_logs)" in
+    *'max-size 10m'*) ok "y el resumen lo puede contar" ;;
+    *) bad "y el resumen lo puede contar" "[$(state_get docker_logs)]" ;;
+esac
+
+# Idempotente: el mismo fichero otra vez no es "ya habia uno ajeno".
+dcfg
+case "$(state_get docker_logs)" in
+    *'max-size 10m'*) ok "reejecutar sobre el nuestro no lo da por ajeno" ;;
+    *) bad "reejecutar sobre el nuestro no lo da por ajeno" "[$(state_get docker_logs)]" ;;
+esac
+
+# Un daemon.json ajeno NO se fusiona a ciegas: se avisa y se deja intacto.
+printf '{ "insecure-registries": ["10.0.0.1:5000"] }\n' > "$DOCKER_DAEMON_JSON"
+antes=$(cat "$DOCKER_DAEMON_JSON")
+dcfg
+is "un daemon.json ajeno se deja intacto" "$antes" "$(cat "$DOCKER_DAEMON_JSON")"
+case "$(state_get docker_logs)" in
+    *'SIN TOCAR'*) ok "y el resumen dice que hay que hacerlo a mano" ;;
+    *) bad "y el resumen dice que hay que hacerlo a mano" "[$(state_get docker_logs)]" ;;
+esac
+
+# --- politica de reinicio -------------------------------------------------
+chk_reboot() { # chk_reboot valor esperado(0|1)
+    if valid_auto_reboot "$1"; then got=0; else got=1; fi
+    if [ "$got" = "$2" ]; then ok "--auto-reboot=$1 $([ "$2" = 0 ] && echo vale || echo 'no vale')"
+    else bad "--auto-reboot=$1" "esperaba rc=$2"; fi
+}
+chk_reboot no    0
+chk_reboot 03:30 0
+chk_reboot 00:00 0
+chk_reboot 23:59 0
+chk_reboot 24:00 1
+chk_reboot 3:30  1
+chk_reboot si    1
+chk_reboot ''    1
+
+# --- unattended_conf ------------------------------------------------------
+CONF_NO=$(unattended_conf no)
+CONF_HR=$(unattended_conf 03:30)
+case "$CONF_NO" in
+    *'Automatic-Reboot "false"'*) ok "por defecto no reinicia solo" ;;
+    *) bad "por defecto no reinicia solo" ;;
+esac
+case "$CONF_NO" in
+    *Automatic-Reboot-Time*) bad "sin hora de reinicio cuando es 'no'" ;;
+    *) ok "sin hora de reinicio cuando es 'no'" ;;
+esac
+case "$CONF_HR" in
+    *'Automatic-Reboot "true"'*'Automatic-Reboot-Time "03:30"'*) ok "con hora, reinicia a esa hora" ;;
+    *) bad "con hora, reinicia a esa hora" "$CONF_HR" ;;
+esac
+# Solo seguridad: ni -updates ni -backports pueden colarse.
+case "$CONF_NO" in
+    *-updates*|*-backports*|*-proposed*) bad "solo entran origenes de seguridad" "$CONF_NO" ;;
+    *) ok "solo entran origenes de seguridad" ;;
+esac
+case "$CONF_NO" in
+    *'#clear Unattended-Upgrade::Allowed-Origins;'*) ok "vacia la lista antes, no la amplia" ;;
+    *) bad "vacia la lista antes, no la amplia" ;;
+esac
+case "$CONF_NO" in
+    *'APT::Periodic::Unattended-Upgrade "1";'*) ok "y el temporizador queda activado" ;;
+    *) bad "y el temporizador queda activado" ;;
+esac
+
+# --no-unattended-upgrades no toca nada.
+UNATTENDED_CONF="$MNT/etc/apt/apt.conf.d/51coolify-unattended"
+# shellcheck disable=SC2034
+AUTO_REBOOT=no
+NO_UNATTENDED=1
+( ok() { :; }; do_updates ) >/dev/null 2>&1
+if [ -e "$UNATTENDED_CONF" ]; then bad "--no-unattended-upgrades no escribe nada"
+else ok "--no-unattended-upgrades no escribe nada"; fi
+is "y lo dice en el resumen" "omitido (--no-unattended-upgrades)" "$(state_get updates)"
+# shellcheck disable=SC2034
+NO_UNATTENDED=''
+
+# --- orden de los pasos ---------------------------------------------------
+# apt-get es lo unico de todo el script que puede pelearse por el lock de dpkg:
+# tiene que quedar DESPUES de que Docker y Coolify hayan terminado con el.
+l_docker=$(grep -n '^run_step docker "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_dcfg=$(grep -n '^run_step docker_config ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_coolify=$(grep -n '^run_step coolify "' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_tsvc=$(grep -n '^run_step tunnel_service ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_upd=$(grep -n '^run_step updates ' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ "$l_docker" -lt "$l_dcfg" ] && [ "$l_dcfg" -lt "$l_coolify" ]; then
+    ok "daemon.json se escribe entre Docker y Coolify"
+else
+    bad "daemon.json se escribe entre Docker y Coolify" \
+        "docker=$l_docker docker_config=$l_dcfg coolify=$l_coolify"
+fi
+if [ "$l_tsvc" -lt "$l_upd" ]; then
+    ok "los parches van despues del tunel, no antes"
+else
+    bad "los parches van despues del tunel, no antes" "tunnel_service=$l_tsvc updates=$l_upd"
+fi
+# Se cuentan las INVOCACIONES, no las menciones: un err/warn que le dice al
+# usuario que instale algo con apt-get no compite por ningun lock.
+malo=''
+for n in $(grep -n 'apt-get' "$ROOT/setup.sh" \
+           | grep -vE '^[0-9]+:[[:space:]]*(err|warn|note|info|#)' | cut -d: -f1); do
+    [ "$n" -gt "$l_tsvc" ] || malo="$malo $n"
+done
+if [ -z "$malo" ]; then
+    ok "ningun apt-get antes de que Docker y Coolify suelten el lock de dpkg"
+else
+    bad "ningun apt-get antes de que Docker y Coolify suelten el lock de dpkg" "lineas:$malo"
+fi
+
+for f in --auto-reboot --no-unattended-upgrades; do
     case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
         *"$f"*) ok "$f aparece en la ayuda" ;;
         *) bad "$f aparece en la ayuda" ;;
@@ -1123,9 +1719,9 @@ PYEOF
     run_hasta_tunel() { # run_hasta_tunel DIRESTADO ARGS...
         _sd=$1; shift
         mkdir -p "$_sd/coolify-setup"
-        for _st in wifi hostname timezone admin_user docker coolify \
-                   coolify_domain coolify_register cloudflared_bin \
-                   tunnel_service retire_installer; do
+        for _st in wifi hostname timezone admin_user docker docker_config \
+                   firewall coolify coolify_domain coolify_register \
+                   cloudflared_bin tunnel_service updates retire_installer; do
             : > "$_sd/coolify-setup/step.$_st"
         done
         env CF_API_BASE="http://127.0.0.1:$PORT" XDG_STATE_HOME="$_sd" \

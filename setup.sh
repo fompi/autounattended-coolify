@@ -62,6 +62,14 @@ fi
 SETUP_ENV_FILE=/etc/coolify-setup.env
 WORK_DIR="$STATE_DIR/work"      # dependencias descargadas, no instaladas
 DONE_MARKER="$STATE_DIR/completed"
+# En variables para que la suite pueda apuntarlas a un directorio de mentira y
+# probar los pasos sin ser root ni tocar el sistema de verdad.
+DOCKER_DAEMON_JSON=/etc/docker/daemon.json
+UNATTENDED_CONF=/etc/apt/apt.conf.d/51coolify-unattended
+FIREWALL_SCRIPT=/usr/local/sbin/coolify-firewall-docker
+FIREWALL_UNIT=/etc/systemd/system/coolify-firewall.service
+# Redes privadas de la RFC 1918. Solo se usan con --allow-lan.
+LAN_CIDRS='10.0.0.0/8 172.16.0.0/12 192.168.0.0/16'
 
 # ============================================================================
 # Salida y registro
@@ -158,6 +166,20 @@ SISTEMA (todo opcional, todo derivado o generado si se omite)
   --installer-user=NOM   Cuenta de rescate creada por el autoinstall. Por
                          defecto: installer.
 
+CORTAFUEGOS
+  --no-firewall          No configurar cortafuegos. Deja el panel de Coolify y
+                         lo que publiquen los contenedores accesibles desde
+                         toda la red local, saltándose el túnel.
+  --ssh-from=CIDR        Aceptar SSH solo desde esa red. La IP desde la que se
+                         está ejecutando esto se añade siempre, para no
+                         dejarte fuera en el mismo comando.
+  --allow-lan            Abrir 80 y 8000 a las redes privadas, a propósito.
+
+MANTENIMIENTO
+  --no-unattended-upgrades  No configurar los parches automáticos de seguridad.
+  --auto-reboot=no|HH:MM Reiniciar solo si un parche lo exige, a esa hora.
+                         Por defecto: no (nunca reinicia solo).
+
 COOLIFY
   --coolify-email=MAIL   Por defecto: se deduce de la cuenta CF, o admin@dominio
   --coolify-password=V   Por defecto: se genera. Acepta @fichero / @-.
@@ -181,6 +203,8 @@ CONTROL
   --non-interactive      Fallar en vez de preguntar si falta algún dato.
   --skip-docker          No instalar Docker.
   --skip-coolify         No instalar Coolify.
+  --skip-coolify-register  No registrar el primer usuario de Coolify. El
+                         registro queda pendiente de hacer a mano.
   --skip-tunnel          No crear el túnel de Cloudflare.
   --reset                Olvidar el estado LOCAL y empezar de cero. No toca
                          nada en Cloudflare: el túnel y los CNAME siguen ahí y
@@ -227,6 +251,9 @@ COOLIFY_EMAIL=''; COOLIFY_PASSWORD=''
 ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
 NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
+SKIP_COOLIFY_REGISTER=''
+NO_UNATTENDED=''; AUTO_REBOOT=no
+NO_FIREWALL=''; SSH_FROM=''; ALLOW_LAN=''
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
 INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 CLOUDFLARED_VERSION=''
@@ -283,6 +310,14 @@ while [ $# -gt 0 ]; do
         --no-geoip)             NO_GEOIP=1 ;;
         --skip-docker)          SKIP_DOCKER=1 ;;
         --skip-coolify)         SKIP_COOLIFY=1 ;;
+        --skip-coolify-register) SKIP_COOLIFY_REGISTER=1 ;;
+        --no-firewall)          NO_FIREWALL=1 ;;
+        --ssh-from=*)           SSH_FROM=${1#*=} ;;
+        --ssh-from)             shift; SSH_FROM=$1 ;;
+        --allow-lan)            ALLOW_LAN=1 ;;
+        --no-unattended-upgrades) NO_UNATTENDED=1 ;;
+        --auto-reboot=*)        AUTO_REBOOT=${1#*=} ;;
+        --auto-reboot)          shift; AUTO_REBOOT=$1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
         --reset)                DO_RESET=1 ;;
         --installer-user=*)     INSTALLER_USER=${1#*=} ;;
@@ -799,6 +834,21 @@ valid_label() {
 valid_email() {
     printf '%s' "$1" | grep -Eq '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
 }
+# Una IP o una red en notación CIDR. Se valida con severidad a propósito: este
+# valor acaba dentro de una orden que se ejecuta con eval, así que lo que no
+# encaje aquí no llega a ninguna parte.
+valid_cidr() {
+    printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' && return 0
+    printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f]{1,4}(:[0-9A-Fa-f]{0,4}){2,7}(/[0-9]{1,3})?$'
+}
+
+# 'no' o una hora HH:MM en 24h. Se valida antes de escribir nada: un valor
+# raro en Automatic-Reboot-Time deja unattended-upgrades sin aplicar parches y
+# sin decir por qué.
+valid_auto_reboot() {
+    [ "$1" = no ] && return 0
+    printf '%s' "$1" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+}
 
 # Nombre del túnel a partir del FQDN del panel. NO del hostname: reinstalar el
 # mini PC con otro hostname creaba un túnel nuevo y dejaba el viejo huérfano en
@@ -890,6 +940,20 @@ gen_password() {
 step_done() { [ -f "$STATE_DIR/step.$1" ]; }
 step_mark() { touch "$STATE_DIR/step.$1"; }
 
+# Estado de un paso, guardado en disco. Hace falta porque run_step NO ejecuta la
+# funcion si el paso ya estaba marcado como hecho: una variable en memoria se
+# queda vacia en el reintento y el resumen acabaria mintiendo sobre lo que de
+# verdad paso (#7). El disco es la unica memoria que sobrevive entre intentos.
+state_set() { printf '%s\n' "$2" > "$STATE_DIR/state.$1"; }
+# state_get NOMBRE [POR_DEFECTO]
+state_get() {
+    if [ -f "$STATE_DIR/state.$1" ]; then
+        head -n1 "$STATE_DIR/state.$1"
+    else
+        printf '%s\n' "${2:-}"
+    fi
+}
+
 # run_step NOMBRE DESCRIPCION funcion
 run_step() {
     _sname=$1; _sdesc=$2; _sfn=$3
@@ -924,7 +988,7 @@ if [ -f "$CONFIG_FILE" ]; then
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
               NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
               WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD \
-              INSTALLER_USER CLOUDFLARED_VERSION \
+              INSTALLER_USER CLOUDFLARED_VERSION SSH_FROM \
               PIN_CLOUDFLARED PIN_DOCKER PIN_COOLIFY OFFLINE_DIR; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
@@ -1143,6 +1207,14 @@ if [ -z "$COOLIFY_EMAIL" ]; then
 fi
 valid_email "$COOLIFY_EMAIL" || die "Email de Coolify no válido: $COOLIFY_EMAIL"
 
+valid_auto_reboot "$AUTO_REBOOT" \
+    || die "--auto-reboot: usa 'no' o una hora HH:MM en 24h. Recibido: $AUTO_REBOOT"
+
+if [ -n "$SSH_FROM" ]; then
+    valid_cidr "$SSH_FROM" \
+        || die "--ssh-from: se espera una IP o una red CIDR. Recibido: $SSH_FROM"
+fi
+
 # El nombre acaba en userdel/usermod: se valida antes de acercarlo a nada.
 printf '%s' "$INSTALLER_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_.-]*$' \
     || die "Nombre de cuenta de rescate no válido: $INSTALLER_USER"
@@ -1186,6 +1258,7 @@ COOLIFY_EMAIL='$COOLIFY_EMAIL'
 COOLIFY_PASSWORD='$(printf '%s' "$COOLIFY_PASSWORD" | sed "s/'/'\\\\''/g")'
 INSTALLER_USER='$INSTALLER_USER'
 CLOUDFLARED_VERSION='$CLOUDFLARED_VERSION'
+SSH_FROM='$SSH_FROM'
 PIN_CLOUDFLARED='$PIN_CLOUDFLARED'
 PIN_DOCKER='$PIN_DOCKER'
 PIN_COOLIFY='$PIN_COOLIFY'
@@ -1341,6 +1414,298 @@ do_docker() {
 }
 run_step docker "Docker" do_docker
 
+# --- Configuración del demonio de Docker ---------------------------------
+# El driver json-file no tiene tope por defecto: los logs de los contenedores
+# crecen hasta llenar el disco, que es el fallo más probable del mes ocho
+# (#11). Va antes de Coolify porque aplicar esto exige reiniciar dockerd, y
+# reiniciarlo con Coolify ya en marcha es tirarle los contenedores encima.
+
+# El daemon.json que queremos. Suelto y puro para poder probarlo: que sea JSON
+# válido no se puede comprobar leyendo el script.
+docker_daemon_json() {
+    # Con printf y no con un heredoc a propósito: en un heredoc la llave de
+    # cierre del JSON iría a la columna 0, y la suite extrae las funciones con
+    # 'sed -n "/^nombre() {/,/^}/p"' — se comería la función por la mitad.
+    printf '%s\n' \
+        '{' \
+        '  "log-driver": "json-file",' \
+        '  "log-opts": { "max-size": "10m", "max-file": "3" }' \
+        '}'
+}
+
+do_docker_config() {
+    if [ -n "$SKIP_DOCKER" ]; then
+        note "omitido por --skip-docker"
+        state_set docker_logs 'omitido (--skip-docker)'
+        return 0
+    fi
+    need_root || return 1
+    if [ -s "$DOCKER_DAEMON_JSON" ]; then
+        # Si es exactamente el nuestro, es un reintento: no hay nada que hacer.
+        if docker_daemon_json | cmp -s - "$DOCKER_DAEMON_JSON"; then
+            state_set docker_logs 'json-file, max-size 10m, max-file 3'
+            ok "$DOCKER_DAEMON_JSON ya tiene el límite de logs"
+            return 0
+        fi
+        # Fusionar JSON ajeno a ciegas con sed o append es la forma más rápida
+        # de dejar a dockerd sin arrancar. Se avisa y se dice qué añadir.
+        warn "Ya existe $DOCKER_DAEMON_JSON con contenido: NO se toca."
+        warn "Los logs de los contenedores siguen SIN tope; hazlo tú."
+        note "Añade dentro del objeto de primer nivel:"
+        note '    "log-driver": "json-file",'
+        note '    "log-opts": { "max-size": "10m", "max-file": "3" }'
+        note "y luego: systemctl restart docker"
+        state_set docker_logs "SIN TOCAR: ya había $DOCKER_DAEMON_JSON (hazlo a mano)"
+        return 0
+    fi
+    mkdir -p "$(dirname "$DOCKER_DAEMON_JSON")" || return 1
+    docker_daemon_json > "$DOCKER_DAEMON_JSON" || return 1
+    chmod 644 "$DOCKER_DAEMON_JSON"
+    # daemon.json solo se lee al arrancar: sin reinicio no aplica nada.
+    if [ -n "$HAS_SYSTEMD" ]; then
+        systemctl restart docker || {
+            err "dockerd no arranca tras escribir $DOCKER_DAEMON_JSON."
+            err "Mira 'journalctl -u docker -n 50 --no-pager' y revisa ese fichero."
+            return 1
+        }
+    else
+        warn "Sin systemd no se reinicia dockerd: el límite no aplicará hasta que lo hagas."
+    fi
+    if have docker && ! docker info >/dev/null 2>&1; then
+        err "Docker no responde tras aplicar $DOCKER_DAEMON_JSON."
+        return 1
+    fi
+    state_set docker_logs 'json-file, max-size 10m, max-file 3'
+    return 0
+}
+run_step docker_config "Límite de logs de Docker" do_docker_config
+
+# --- Cortafuegos ----------------------------------------------------------
+# Sin esto el equipo termina con 22, 80, 8000 y lo que publique cada
+# contenedor abiertos a toda la red local: el túnel deja de ser LA entrada y
+# pasa a ser UNA entrada, con Cloudflare Access decorando una puerta que tiene
+# otra al lado (#4).
+#
+# Va DESPUÉS de docker_config y ANTES de coolify. El orden no es estético:
+# escribir daemon.json obliga a reiniciar dockerd, y al arrancar, dockerd VACÍA
+# y recrea la cadena DOCKER-USER. Al revés, las reglas de aquí desaparecerían en
+# ese reinicio y el cortafuegos quedaría sin efecto sin decir ni una palabra.
+
+# Interfaz de la ruta por defecto a partir de la salida de 'ip route'.
+iface_from_ip_route() {
+    printf '%s\n' "$1" \
+        | awk '/^default/ { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }'
+}
+# Lo mismo leyendo /proc/net/route, para un sistema sin iproute2. La segunda
+# columna a 00000000 es el destino 0.0.0.0, o sea la ruta por defecto.
+iface_from_proc_route() {
+    [ -r "$1" ] || return 0
+    awk 'NR > 1 && $2 == "00000000" { print $1; exit }' "$1"
+}
+firewall_ext_iface() {
+    _fi=''
+    if have ip; then
+        _fi=$(iface_from_ip_route "$(ip -4 route show default 2>/dev/null || true)")
+    fi
+    [ -n "$_fi" ] || _fi=$(iface_from_proc_route /proc/net/route)
+    # El nombre acaba dentro de una orden que se ejecuta con eval: lo que no
+    # parezca un nombre de interfaz no sale de aquí.
+    if printf '%s' "$_fi" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._@-]*$'; then
+        printf '%s' "$_fi"
+    fi
+}
+
+# IP desde la que llega la sesión actual, si viene por SSH.
+ssh_client_ip() {
+    _sc="${SSH_CONNECTION:-}"
+    [ -n "$_sc" ] || _sc="${SSH_CLIENT:-}"
+    [ -n "$_sc" ] || return 0
+    _si=$(printf '%s' "$_sc" | awk '{print $1}')
+    if valid_cidr "$_si"; then printf '%s' "$_si"; fi
+}
+
+# La política de ufw, una orden por línea. Imprime en vez de ejecutar: así la
+# suite puede comprobar QUÉ se abre sin ufw, sin iptables y sin ser root, y el
+# paso puede pararse en seco si una sola de las órdenes falla.
+ufw_plan() {
+    printf 'ufw default deny incoming\n'
+    printf 'ufw default allow outgoing\n'
+    # SSH SIEMPRE, y siempre antes del enable.
+    if [ -n "$SSH_FROM" ]; then
+        printf 'ufw allow from %s to any port 22 proto tcp\n' "$SSH_FROM"
+        # Y siempre, además, la IP desde la que se está ejecutando esto: con un
+        # --ssh-from mal calculado el operador se autoexpulsaría en el mismo
+        # comando desde el que está conectado, sin forma de volver a entrar.
+        _me=$(ssh_client_ip)
+        if [ -n "$_me" ] && [ "$_me" != "$SSH_FROM" ]; then
+            printf 'ufw allow from %s to any port 22 proto tcp\n' "$_me"
+        fi
+    else
+        printf 'ufw allow 22/tcp\n'
+    fi
+    # 80 y 8000 NO se abren: cloudflared abre la conexión HACIA Cloudflare, no
+    # recibe nada de fuera. Abrirlos solo sirve para saltarse el túnel.
+    if [ -n "$ALLOW_LAN" ]; then
+        for _n in $LAN_CIDRS; do
+            printf 'ufw allow from %s to any port 80 proto tcp\n' "$_n"
+            printf 'ufw allow from %s to any port 8000 proto tcp\n' "$_n"
+        done
+    fi
+}
+
+# Las reglas de la cadena DOCKER-USER, una por línea.
+#
+# Existe porque ufw NO filtra los puertos que publica Docker: dockerd mete sus
+# propias reglas en FORWARD por delante de las de ufw, así que un contenedor con
+# -p 8080:80 es accesible aunque ufw diga que no. Poner {"iptables": false} en
+# daemon.json tampoco vale: eso rompe la red de los contenedores. El único
+# gancho que Docker soporta es DOCKER-USER, que consulta antes que las suyas.
+#
+# docker_user_plan INTERFAZ_EXTERNA
+docker_user_plan() {
+    _df=$1
+    printf 'iptables -F DOCKER-USER\n'
+    # ESTABLISHED,RELATED la PRIMERA, sin discusión: es el tráfico de vuelta de
+    # todo lo que sale del equipo. Detrás del DROP, Coolify no podría ni
+    # descargar una imagen.
+    printf 'iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN\n'
+    printf 'iptables -A DOCKER-USER -i lo -j RETURN\n'
+    if [ -n "$ALLOW_LAN" ]; then
+        for _n in $LAN_CIDRS; do
+            printf 'iptables -A DOCKER-USER -i %s -s %s -p tcp --dport 80 -j RETURN\n' "$_df" "$_n"
+            printf 'iptables -A DOCKER-USER -i %s -s %s -p tcp --dport 8000 -j RETURN\n' "$_df" "$_n"
+        done
+    fi
+    # El -i es OBLIGATORIO. Un DROP sin -i tira también lo que va de los
+    # contenedores hacia internet, que entra por docker0/br-*, y deja el equipo
+    # sin poder descargar nada.
+    printf 'iptables -A DOCKER-USER -i %s -j DROP\n' "$_df"
+    printf 'iptables -A DOCKER-USER -j RETURN\n'
+}
+
+# El script que reaplica DOCKER-USER en cada arranque de dockerd. Hace falta
+# porque dockerd vacía y recrea esa cadena al arrancar: sin esto las reglas
+# durarían hasta el primer reinicio y nadie se enteraría. No se usa
+# iptables-persistent a propósito: arrastra apt y debconf, y esto tiene que
+# funcionar sin que nadie conteste a nada.
+firewall_script() {
+    printf '#!/bin/sh\n'
+    printf '# Generado por setup.sh (#4). NO editar: se reescribe al reejecutar.\n'
+    printf '# dockerd vacia y recrea DOCKER-USER en cada arranque; esto la repone.\n'
+    printf 'set -eu\n'
+    printf 'iptables -nL DOCKER-USER >/dev/null 2>&1 || iptables -N DOCKER-USER\n'
+    docker_user_plan "$1"
+}
+
+firewall_unit() {
+    printf '[Unit]\n'
+    printf 'Description=Reglas DOCKER-USER de coolify-setup\n'
+    printf 'After=docker.service\n'
+    printf 'Requires=docker.service\n'
+    # PartOf es la pieza clave: hace que un 'systemctl restart docker' arrastre
+    # esta unidad detrás. Sin ella, reiniciar Docker deja el equipo abierto.
+    printf 'PartOf=docker.service\n'
+    printf '\n[Service]\n'
+    printf 'Type=oneshot\n'
+    printf 'RemainAfterExit=yes\n'
+    printf 'ExecStart=%s\n' "$FIREWALL_SCRIPT"
+    printf '\n[Install]\n'
+    printf 'WantedBy=multi-user.target\n'
+}
+
+do_firewall() {
+    if [ -n "$NO_FIREWALL" ]; then
+        warn "Cortafuegos desactivado por --no-firewall."
+        warn "El panel y lo que publiquen los contenedores quedan accesibles desde"
+        warn "toda la red local, saltándose el túnel y Cloudflare Access."
+        state_set firewall 'DESACTIVADO por --no-firewall'
+        state_set firewall_ssh 'sin filtrar'
+        state_set firewall_lan 'todo lo que escuche es accesible en la LAN'
+        return 0
+    fi
+    need_root || return 1
+    if [ "$OS_N" != linux ]; then
+        warn "El cortafuegos solo está automatizado en Linux; se omite."
+        state_set firewall 'omitido (solo automatizado en Linux)'
+        return 0
+    fi
+    have ufw || {
+        err "ufw no está instalado y es lo que se usa para la política de entrada."
+        err "Instálalo (apt-get install ufw) o reejecuta con --no-firewall."
+        return 1
+    }
+    have iptables || {
+        err "iptables no está disponible y sin él no se puede tocar DOCKER-USER,"
+        err "que es lo único que filtra los puertos publicados por Docker."
+        return 1
+    }
+
+    _ext=$(firewall_ext_iface)
+    if [ -z "$_ext" ]; then
+        err "No se ha podido determinar la interfaz externa (la de la ruta por defecto)."
+        err "Sin ella la regla de DOCKER-USER iría sin '-i', y un DROP sin '-i' corta"
+        err "también el tráfico de los contenedores hacia internet: Coolify no podría"
+        err "ni descargar una imagen. Se prefiere fallar aquí a instalar esa regla."
+        err "Arregla la ruta por defecto o reejecuta con --no-firewall."
+        return 1
+    fi
+
+    # El orden NO es negociable: primero TODAS las reglas, el enable al final.
+    # Si una sola falla no se activa nada, porque activar un 'deny incoming' sin
+    # la regla de SSH deja fuera a quien está ejecutando esto y ya no hay vuelta
+    # atrás. Y en ningún momento un 'ufw --force reset': eso tira las conexiones
+    # abiertas, la actual incluida.
+    _plan="$WORK_DIR/ufw.plan"
+    ufw_plan > "$_plan" || return 1
+    while IFS= read -r _cmd; do
+        [ -n "$_cmd" ] || continue
+        _logfile "cortafuegos: $_cmd"
+        if ! eval "$_cmd" >>"$LOG_FILE" 2>&1; then
+            err "Falló: $_cmd"
+            err "NO se activa el cortafuegos: hacerlo sin esa regla puede dejarte fuera."
+            return 1
+        fi
+    done < "$_plan"
+    ufw --force enable >>"$LOG_FILE" 2>&1 || { err "'ufw enable' falló."; return 1; }
+    ok "ufw activo: entra 22/tcp, nada más"
+
+    mkdir -p "$(dirname "$FIREWALL_SCRIPT")" || return 1
+    firewall_script "$_ext" > "$FIREWALL_SCRIPT" || return 1
+    chmod 755 "$FIREWALL_SCRIPT"
+    if [ -n "$HAS_SYSTEMD" ]; then
+        mkdir -p "$(dirname "$FIREWALL_UNIT")" || return 1
+        firewall_unit > "$FIREWALL_UNIT" || return 1
+        chmod 644 "$FIREWALL_UNIT"
+        _unit=$(basename "$FIREWALL_UNIT")
+        systemctl daemon-reload >>"$LOG_FILE" 2>&1 || return 1
+        systemctl enable --now "$_unit" >>"$LOG_FILE" 2>&1 || {
+            err "No se pudieron aplicar las reglas de DOCKER-USER ($_unit)."
+            err "Mira: journalctl -u $_unit -n 50 --no-pager"
+            return 1
+        }
+    else
+        warn "Sin systemd las reglas se aplican ahora, pero dockerd las borrará en el"
+        warn "próximo arranque. Ejecuta $FIREWALL_SCRIPT tras cada reinicio."
+        sh "$FIREWALL_SCRIPT" >>"$LOG_FILE" 2>&1 \
+            || { err "No se pudieron aplicar las reglas de DOCKER-USER."; return 1; }
+    fi
+
+    state_set firewall "activo (ufw + DOCKER-USER en $_ext)"
+    if [ -n "$SSH_FROM" ]; then
+        _me=$(ssh_client_ip)
+        state_set firewall_ssh "22/tcp desde $SSH_FROM${_me:+ y desde $_me}"
+    else
+        state_set firewall_ssh '22/tcp desde cualquier sitio'
+    fi
+    if [ -n "$ALLOW_LAN" ]; then
+        state_set firewall_lan 'ABIERTA: 80 y 8000 accesibles en la red local (--allow-lan)'
+    else
+        state_set firewall_lan 'cerrada: 80 y 8000 solo por el túnel'
+    fi
+    return 0
+}
+run_step firewall "Cortafuegos" do_firewall
+
 # --- Coolify --------------------------------------------------------------
 wait_for_http() {
     # wait_for_http URL SEGUNDOS
@@ -1394,9 +1759,35 @@ run_step coolify_domain "Dominio del panel -> $COOLIFY_FQDN" do_coolify_domain
 # Registro del primer usuario. Coolify no expone API para esto (el token de API
 # se genera desde la UI, después de existir un usuario), así que se automatiza
 # el formulario público /register. Si falla, se deja indicado en el resumen.
-COOLIFY_REGISTERED=''
+#
+# El estado va a disco (state_set), NO a una variable: run_step no reejecuta un
+# paso ya hecho, y en un reintento una variable en memoria quedaría vacía y el
+# resumen diría "pendiente" de un usuario que sí se registró (#7).
+# Valores: registrado | ya-existia | pendiente | omitido
+
+# Cierto si ese HTML es el formulario de REGISTRO de Coolify.
+# No basta con buscar 'name="_token"': el formulario de login lleva uno igual, y
+# tras crear el primer usuario Coolify manda justo ahí. El campo que solo existe
+# en el registro es password_confirmation, así que se exigen los dos.
+register_form_offered() {
+    case "$1" in
+        *'name="_token"'*) : ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *password_confirmation*) return 0 ;;
+    esac
+    return 1
+}
+
 do_coolify_register() {
-    [ -n "$SKIP_COOLIFY" ] && return 0
+    [ -n "$SKIP_COOLIFY" ] && { state_set coolify_register omitido; return 0; }
+    if [ -n "$SKIP_COOLIFY_REGISTER" ]; then
+        note "omitido por --skip-coolify-register"
+        state_set coolify_register omitido
+        return 0
+    fi
+    state_set coolify_register pendiente
     if [ "$HTTP" != curl ]; then
         warn "El registro automático del primer usuario necesita curl; hazlo manualmente."
         return 0
@@ -1407,11 +1798,13 @@ do_coolify_register() {
         warn "No se pudo abrir /register; regístrate manualmente."; return 0; }
 
     # Si Coolify ya tiene usuario, /register redirige o no muestra el formulario.
-    case "$page" in
-        *'name="_token"'*) : ;;
-        *) warn "Coolify no muestra el formulario de registro (¿ya hay un usuario?). Regístrate manualmente."
-           return 0 ;;
-    esac
+    if ! register_form_offered "$page"; then
+        state_set coolify_register ya-existia
+        warn "Coolify no muestra el formulario de registro: ya hay un usuario creado."
+        note "Se conserva el que hay; entra con sus credenciales, no con las de este fichero."
+        rm -f "$jar"
+        return 0
+    fi
     token=$(printf '%s' "$page" | sed -n 's/.*name="_token"[^>]*value="\([^"]*\)".*/\1/p' | head -n1)
     [ -n "$token" ] || token=$(printf '%s' "$page" | sed -n 's/.*value="\([^"]*\)"[^>]*name="_token".*/\1/p' | head -n1)
     [ -n "$token" ] || { warn "No se pudo extraer el token CSRF; regístrate manualmente."; return 0; }
@@ -1425,17 +1818,29 @@ do_coolify_register() {
         --data-urlencode "password_confirmation=$COOLIFY_PASSWORD" \
         "http://localhost:8000/register" 2>/dev/null) || code=000
 
-    case "$code" in
-        302|200|303)
-            COOLIFY_REGISTERED=1
-            ok "Primer usuario de Coolify registrado ($COOLIFY_EMAIL)"
-            ;;
-        *)
-            warn "El registro automático devolvió HTTP $code; tendrás que registrarte a mano."
-            _logfile "Respuesta de registro guardada en $WORK_DIR/register-response.html"
-            ;;
-    esac
+    # El código HTTP no dice la verdad: Laravel devuelve 200 con el formulario
+    # otra vez y los errores de validación pintados dentro. Dar por bueno un 200
+    # es exactamente el fallo de #7. La única comprobación que no miente es
+    # volver a pedir /register: Coolify lo cierra en cuanto existe un usuario,
+    # así que si sigue ofreciendo el formulario, no se registró nadie.
+    # -L a propósito: si redirige a /login, lo que llega es el login, que no
+    # tiene password_confirmation y por tanto cuenta como "ya no hay registro".
+    after=$(curl -sS -L -b "$jar" -A "$UA" "http://localhost:8000/register" 2>/dev/null) || after=''
     rm -f "$jar"
+    if [ -z "$after" ]; then
+        warn "No se pudo releer /register para comprobar el registro (HTTP $code del POST)."
+        note "Queda como PENDIENTE a propósito: sin comprobar, no se afirma."
+        return 0
+    fi
+    if register_form_offered "$after"; then
+        warn "El registro automático NO cuajó: /register sigue ofreciendo el formulario"
+        warn "(el POST devolvió HTTP $code, que por sí solo no significa nada)."
+        note "Respuesta guardada en $WORK_DIR/register-response.html"
+        note "Regístrate a mano con el email y la contraseña del fichero de credenciales."
+        return 0
+    fi
+    state_set coolify_register registrado
+    ok "Primer usuario de Coolify registrado y COMPROBADO ($COOLIFY_EMAIL)"
     return 0
 }
 run_step coolify_register "Primer usuario de Coolify" do_coolify_register
@@ -1730,6 +2135,82 @@ do_tunnel_service() {
 }
 run_step tunnel_service "Servicio cloudflared" do_tunnel_service
 
+# --- Parches automáticos de seguridad -------------------------------------
+# Va AQUI, al final, y no junto al resto de la configuración del sistema: es lo
+# único de todo el script que llama a apt-get, y un apt-get compitiendo por el
+# lock de dpkg con el instalador de Docker o con el de Coolify no falla limpio,
+# cuelga las dos cosas. Cuando llega aquí ya no queda nadie usando dpkg.
+
+# El fichero de configuración, suelto para poder probarlo.
+# unattended_conf no|HH:MM
+unattended_conf() {
+    cat <<'EOF'
+// Escrito por setup.sh (#11). Solo parches de SEGURIDAD: en un equipo que
+// publica servicios importa más la previsibilidad que estar al día de todo.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+
+// Ojo: '#clear' NO es un comentario, es la directiva de apt para vaciar una
+// lista. Sin ella, lo de abajo se SUMARIA a lo que traiga 50unattended-upgrades
+// en vez de sustituirlo, y volverían a entrar orígenes que no son de seguridad.
+#clear Unattended-Upgrade::Allowed-Origins;
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+    };
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+EOF
+    if [ "$1" = no ]; then
+        printf 'Unattended-Upgrade::Automatic-Reboot "false";\n'
+    else
+        printf 'Unattended-Upgrade::Automatic-Reboot "true";\n'
+        printf 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";\n'
+        printf 'Unattended-Upgrade::Automatic-Reboot-Time "%s";\n' "$1"
+    fi
+}
+
+do_updates() {
+    if [ -n "$NO_UNATTENDED" ]; then
+        note "omitido por --no-unattended-upgrades"
+        state_set updates 'omitido (--no-unattended-upgrades)'
+        return 0
+    fi
+    need_root || return 1
+    if [ "$OS_N" != linux ]; then
+        state_set updates 'omitido (solo automatizado en Linux)'
+        return 0
+    fi
+    if ! have apt-get; then
+        warn "No es un sistema con apt: los parches automáticos hay que montarlos a mano."
+        state_set updates 'omitido (no es un sistema apt)'
+        return 0
+    fi
+    if [ ! -x /usr/bin/unattended-upgrade ]; then
+        info "Instalando unattended-upgrades"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q unattended-upgrades </dev/null \
+            || { err "No se pudo instalar unattended-upgrades."; return 1; }
+    fi
+    mkdir -p "$(dirname "$UNATTENDED_CONF")" || return 1
+    unattended_conf "$AUTO_REBOOT" > "$UNATTENDED_CONF" || return 1
+    chmod 644 "$UNATTENDED_CONF"
+    if [ -n "$HAS_SYSTEMD" ]; then
+        systemctl enable --now unattended-upgrades >/dev/null 2>&1 \
+            || warn "No se pudo activar el servicio unattended-upgrades; revísalo."
+    fi
+    if [ "$AUTO_REBOOT" = no ]; then
+        state_set updates 'solo seguridad, sin reinicio automático'
+    else
+        state_set updates "solo seguridad, reinicio automático a las $AUTO_REBOOT si hace falta"
+    fi
+    return 0
+}
+run_step updates "Parches automáticos de seguridad" do_updates
+
 # --- Cuenta de rescate ----------------------------------------------------
 # Va la última a propósito: mientras algo pueda fallar, la cuenta 'installer'
 # es la única vía de entrada garantizada, que es justo para lo que existe.
@@ -1905,13 +2386,30 @@ write_summaries() {
         printf '  Panel ............. https://%s\n' "$COOLIFY_FQDN"
         printf '  Email ............. %s\n' "$COOLIFY_EMAIL"
         printf '  Contraseña ........ en %s\n' "$CREDS_FILE"
-        if [ -n "$COOLIFY_REGISTERED" ]; then
-            printf '  Estado ............ usuario registrado, listo para entrar\n'
-        elif [ -z "$SKIP_COOLIFY" ]; then
-            printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
-            printf '                      el email y contraseña de las credenciales\n'
-            printf '                      (el primer usuario registrado es el propietario).\n'
-        fi
+        # Tres estados de verdad, leidos del disco y no de una variable: en un
+        # reintento el paso no se reejecuta y la variable estaria vacia (#7).
+        case "$(state_get coolify_register pendiente)" in
+            registrado)
+                printf '  Estado ............ usuario registrado y comprobado, listo para entrar\n'
+                ;;
+            ya-existia)
+                printf '  Estado ............ YA EXISTIA un usuario: no se ha tocado\n'
+                printf '                      Entra con las credenciales de ese usuario; la\n'
+                printf '                      contraseña de este fichero no es la suya.\n'
+                ;;
+            omitido)
+                if [ -n "$SKIP_COOLIFY" ]; then
+                    printf '  Estado ............ omitido (--skip-coolify)\n'
+                else
+                    printf '  Estado ............ omitido (--skip-coolify-register): registrate a mano\n'
+                fi
+                ;;
+            *)
+                printf '  Estado ............ PENDIENTE: abre el panel y regístrate con\n'
+                printf '                      el email y contraseña de las credenciales\n'
+                printf '                      (el primer usuario registrado es el propietario).\n'
+                ;;
+        esac
         printf '\nAPPS\n'
         printf '  Patrón de dominio . https://<lo-que-sea>.%s.%s\n' "$APP_SUBDOMAIN" "$ROOT_DOMAIN"
         printf '  Al crear una app en Coolify, ponle un dominio con ese patrón:\n'
@@ -1927,6 +2425,19 @@ write_summaries() {
         printf '\nVERSIONES\n'
         version_table
         printf '  Tambien en %s (0644)\n' "$VERSION_FILE"
+        printf '\nCORTAFUEGOS\n'
+        printf '  Estado ............ %s\n' "$(state_get firewall 'sin configurar')"
+        printf '  Entrada SSH ....... %s\n' "$(state_get firewall_ssh 'n/d')"
+        printf '  Red local ......... %s\n' "$(state_get firewall_lan 'n/d')"
+        printf '  Los puertos que publican los contenedores NO los filtra ufw: van\n'
+        printf '  por la cadena DOCKER-USER, que %s repone en cada\n' "$(basename "$FIREWALL_UNIT")"
+        printf '  arranque de dockerd porque Docker la borra al arrancar.\n'
+        printf '\nMANTENIMIENTO\n'
+        printf '  Logs de Docker .... %s\n' "$(state_get docker_logs 'sin configurar')"
+        printf '  Actualizaciones ... %s\n' "$(state_get updates 'sin configurar')"
+        printf '  Copias y monitorización: NO configuradas. Este equipo no tiene\n'
+        printf '  copia de /data/coolify ni aviso si el túnel se cae; montarlo es\n'
+        printf '  cosa tuya antes de darle uso serio.\n'
         printf '\nESTADO DE SERVICIOS\n'
         printf '  docker ............ %s\n' "$(svc_state docker)"
         printf '  cloudflared ....... %s\n' "$(svc_state cloudflared)"
