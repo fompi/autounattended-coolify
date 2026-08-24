@@ -7,7 +7,7 @@
 #   sh tests/run.sh              # todo
 #   sh tests/run.sh json build   # solo esos grupos
 #
-# Grupos: syntax json validators timezone secrets resolution build latecommands
+# Grupos: syntax json validators timezone secrets installer resolution build latecommands
 #
 # Lo que NO cubre, y hay que probar a mano en una VM: el arranque real desde
 # la ISO, y el paso tunnel_service (habla con el edge real de Cloudflare).
@@ -45,7 +45,7 @@ is() {
 
 # Ojo: no llamar a esta variable GROUPS. En bash es especial (los grupos del
 # usuario) y asignarla revienta el script bajo 'set -e'.
-WANTED="${*:-syntax json validators timezone secrets resolution build latecommands}"
+WANTED="${*:-syntax json validators timezone secrets installer resolution build latecommands}"
 want() {
     for g in $WANTED; do [ "$g" = "$1" ] && return 0; done
     return 1
@@ -267,6 +267,8 @@ fake_config() {
     ROOT_DOMAIN='fompi.net'
     APP_WILDCARD='*.app.fompi.net'
     TUNNEL_ID='tid'
+    INSTALLER_USER='installer'
+    INSTALLER_STATE='bloqueada, fuera de sudo y con shell /usr/sbin/nologin'
     LOG_FILE="$SEC/log"
     IS_ROOT=''
     KEEP_SECRETS=''
@@ -292,6 +294,10 @@ fi
 case "$(cat "$SUMMARY_FILE")" in
     *"$CREDS_FILE"*) ok "el resumen dice donde estan las credenciales" ;;
     *) bad "el resumen dice donde estan las credenciales" ;;
+esac
+case "$(cat "$SUMMARY_FILE")" in
+    *'Cuenta de rescate'*'fuera de sudo'*) ok "el resumen dice como quedo la cuenta de rescate" ;;
+    *) bad "el resumen dice como quedo la cuenta de rescate" ;;
 esac
 if have stat; then
     for f in "$SUMMARY_FILE" "$CREDS_FILE"; do
@@ -343,6 +349,91 @@ else
         "resumen=${l_sum:-?} marca=${l_mark:-?} borrado=${l_wipe:-?}"
 fi
 for f in --keep-secrets --summary-no-secrets; do
+    case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
+        *"$f"*) ok "$f aparece en la ayuda" ;;
+        *) bad "$f aparece en la ayuda" ;;
+    esac
+done
+fi
+
+# -------------------------------------------------------------- installer
+if want installer; then
+group "Cuenta de rescate 'installer' (#9)"
+eval "$(sed -n '/^groups_have_admin() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^shadow_hash_is_real() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^shadow_field() {/,/^}/p' "$ROOT/setup.sh")"
+eval "$(sed -n '/^nologin_shell() {/,/^}/p' "$ROOT/setup.sh")"
+
+chk() { # chk descripcion fn arg esperado(0|1)
+    if "$2" "$3"; then got=0; else got=1; fi
+    if [ "$got" = "$4" ]; then ok "$1"; else bad "$1" "esperaba rc=$4"; fi
+}
+chk "grupo sudo manda"            groups_have_admin "usuario docker sudo" 0
+chk "grupo wheel manda"           groups_have_admin "wheel" 0
+chk "grupo admin manda"           groups_have_admin "staff admin" 0
+chk "sin grupo de mando"          groups_have_admin "usuario docker users" 1
+chk "lista vacia no manda"        groups_have_admin "" 1
+# Regresion: 'sudoers' no es 'sudo'.
+chk "sudoers no cuela por sudo"   groups_have_admin "sudoers pseudo" 1
+
+chk "hash sha512 es utilizable"   shadow_hash_is_real '$6$sal$hash' 0
+chk "hash yescrypt es utilizable" shadow_hash_is_real '$y$j9T$sal$hash' 0
+chk "vacio no es credencial"      shadow_hash_is_real '' 1
+chk "cuenta bloqueada con !"      shadow_hash_is_real '!' 1
+chk "bloqueada con !!"            shadow_hash_is_real '!!' 1
+chk "bloqueada conservando hash"  shadow_hash_is_real '!$6$sal$hash' 1
+chk "deshabilitada con *"         shadow_hash_is_real '*' 1
+chk "x de passwd no es hash"      shadow_hash_is_real 'x' 1
+
+SH="$TMP/shadow"
+cat > "$SH" <<'SHADOW'
+root:!:19000:0:99999:7:::
+admin:$6$sal$hash:19000:0:99999:7:::
+installer:!:19000:0:99999:7:::
+SHADOW
+is "shadow_field lee el hash"        '$6$sal$hash' "$(shadow_field "$SH" admin)"
+is "shadow_field ve la bloqueada"    '!'           "$(shadow_field "$SH" installer)"
+is "shadow_field con usuario ausente" ''           "$(shadow_field "$SH" nadie)"
+is "shadow_field sin fichero"        ''            "$(shadow_field "$TMP/no-hay" admin)"
+
+NS=$(nologin_shell)
+case "$NS" in
+    /*nologin|/*false) ok "nologin_shell devuelve una shell que no deja entrar" ;;
+    *) bad "nologin_shell devuelve una shell que no deja entrar" "$NS" ;;
+esac
+
+# El paso tiene que ser el ultimo: mientras algo pueda fallar, 'installer' es
+# la unica via de entrada garantizada.
+last=$(grep -n '^run_step ' "$ROOT/setup.sh" | tail -n1)
+case "$last" in
+    *retire_installer*) ok "retire_installer es el ultimo run_step" ;;
+    *) bad "retire_installer es el ultimo run_step" "el ultimo es: $last" ;;
+esac
+l_tun=$(grep -n '^run_step tunnel_service' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+l_ret=$(grep -n '^run_step retire_installer' "$ROOT/setup.sh" | cut -d: -f1 | head -n1)
+if [ -n "$l_tun" ] && [ -n "$l_ret" ] && [ "$l_tun" -lt "$l_ret" ]; then
+    ok "va despues de tunnel_service"
+else
+    bad "va despues de tunnel_service" "tunnel=${l_tun:-?} retire=${l_ret:-?}"
+fi
+
+# Y NO puede abortar la instalacion: si aborta, el usuario se queda sin el
+# fichero de credenciales, que es mucho peor que una cuenta de rescate viva.
+sed -n '/^do_retire_installer() {/,/^}/p' "$ROOT/setup.sh" > "$TMP/retire.sh"
+if [ -s "$TMP/retire.sh" ]; then ok "do_retire_installer se puede extraer"
+else bad "do_retire_installer se puede extraer"; fi
+n=$(grep -cE '(^|[^_[:alnum:]])die ' "$TMP/retire.sh" || true)
+is "no llama a die" "0" "$n"
+n=$(grep -cE '^[[:space:]]*return [1-9]' "$TMP/retire.sh" || true)
+is "todos los return son 0" "0" "$n"
+# La shell nologin es imprescindible: 'usermod -L' no impide entrar por clave.
+if grep -q 'usermod -s' "$TMP/retire.sh"; then
+    ok "ademas de bloquear, cambia la shell a nologin"
+else
+    bad "ademas de bloquear, cambia la shell a nologin" "usermod -L no cierra el SSH por clave"
+fi
+
+for f in --keep-rescue --purge-installer --installer-user; do
     case "$(sh "$ROOT/setup.sh" --help 2>&1)" in
         *"$f"*) ok "$f aparece en la ayuda" ;;
         *) bad "$f aparece en la ayuda" ;;

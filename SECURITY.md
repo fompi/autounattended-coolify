@@ -40,6 +40,10 @@ de root. Conviene tener claro qué protege y qué no.
 - **Borrado seguro.** Los secretos se borran con `shred -u` cuando está
   disponible, pero sobre SSD, COW o sistemas con journal eso **no garantiza**
   que el contenido desaparezca del medio físico.
+- **La cuenta de rescate mientras la instalación no termine.** Con
+  `--rescue-password`, hasta que el último paso la retira hay una cuenta `sudo`
+  con una contraseña que comparten todos los equipos hechos con ese USB. Ver
+  «La cuenta de rescate» más abajo.
 
 ## Qué pasa con los secretos al terminar
 
@@ -84,6 +88,36 @@ perder funcionalidad: sin ella el equipo se queda en UTC, que en un servidor es
 una elección perfectamente defendible.
 
 Ninguna descarga se verifica contra un hash o una firma (ver más arriba).
+
+## La cuenta de rescate
+
+El autoinstall crea una cuenta `installer` en el grupo `sudo`. Nace bloqueada
+(`!`), pero con `--rescue-password` nace con una **contraseña real y
+permanente**, y con SSH por contraseña admitido y un nombre adivinable: un
+usuario por defecto con contraseña por defecto, que es exactamente lo que
+buscan los escáneres. Peor aún, la contraseña se elige al construir el USB, así
+que **todos los equipos instalados con ese mismo USB comparten la misma
+contraseña de root efectiva**.
+
+El último paso de `setup.sh` la retira, y solo después de comprobar que el
+administrador real existe, está en `sudo`/`wheel`/`admin` y tiene una
+credencial utilizable (hash de verdad en `/etc/shadow` o `authorized_keys` no
+vacío). Por defecto la bloquea, la saca de sudo y le pone una shell de
+`nologin` — lo de la shell no es adorno: `usermod -L` tacha el hash pero **no**
+impide entrar con clave SSH.
+
+Ese paso nunca aborta la instalación: si no puede retirarla, avisa y lo deja
+escrito en el resumen, que indica siempre en qué estado quedó la cuenta.
+Abortar dejaría al usuario sin el fichero de credenciales generadas, que es
+peor. Y si el asistente **falla a mitad**, la cuenta sigue viva a propósito:
+es la vía de rescate. En ese caso, retírala a mano cuando recuperes el acceso:
+
+```bash
+usermod -L installer && usermod -s /usr/sbin/nologin installer
+gpasswd -d installer sudo
+```
+
+`--purge-installer` la borra con su home, `--keep-rescue` la conserva.
 
 ## Manejo de secretos
 

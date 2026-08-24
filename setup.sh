@@ -130,6 +130,8 @@ SISTEMA (todo opcional, todo derivado o generado si se omite)
                          Equivale a la variable de entorno NO_GEOIP=1.
   --wifi-ssid=SSID       Solo se usa (y se pregunta) si no hay red al arrancar.
   --wifi-password=V      Acepta @fichero / @-.
+  --installer-user=NOM   Cuenta de rescate creada por el autoinstall. Por
+                         defecto: installer.
 
 COOLIFY
   --coolify-email=MAIL   Por defecto: se deduce de la cuenta CF, o admin@dominio
@@ -146,6 +148,10 @@ CONTROL
                          Cloudflare, el del túnel y la configuración resuelta.
   --summary-no-secrets   No imprimir contraseñas por pantalla al terminar; se
                          quedan solo en el fichero de credenciales.
+  --keep-rescue          Dejar la cuenta de rescate tal cual, con su sudo y su
+                         contraseña si se puso --rescue-password al construir.
+  --purge-installer      Borrar la cuenta de rescate y su home (userdel -r) en
+                         vez de bloquearla.
   --dry-run              Mostrar la configuración resuelta y salir.
   -h, --help             Esta ayuda.
 
@@ -174,6 +180,7 @@ ASSUME_YES=''; NON_INTERACTIVE=''; DRY_RUN=''
 NO_GEOIP="${NO_GEOIP:-}"
 SKIP_DOCKER=''; SKIP_COOLIFY=''; SKIP_TUNNEL=''; DO_RESET=''
 KEEP_SECRETS=''; SUMMARY_NO_SECRETS=''
+INSTALLER_USER=''; KEEP_RESCUE=''; PURGE_INSTALLER=''
 
 # Argumentos horneados en el USB al construirlo (via EnvironmentFile del
 # servicio systemd). Van delante para que lo que se pase a mano los pueda pisar.
@@ -218,6 +225,10 @@ while [ $# -gt 0 ]; do
         --skip-coolify)         SKIP_COOLIFY=1 ;;
         --skip-tunnel)          SKIP_TUNNEL=1 ;;
         --reset)                DO_RESET=1 ;;
+        --installer-user=*)     INSTALLER_USER=${1#*=} ;;
+        --installer-user)       shift; INSTALLER_USER=$1 ;;
+        --keep-rescue)          KEEP_RESCUE=1 ;;
+        --purge-installer)      PURGE_INSTALLER=1 ;;
         --keep-secrets)         KEEP_SECRETS=1 ;;
         --summary-no-secrets)   SUMMARY_NO_SECRETS=1 ;;
         --dry-run)              DRY_RUN=1 ;;
@@ -615,6 +626,38 @@ tz_is_placeholder() {
     esac
 }
 
+# Cierto si alguno de los grupos de la lista da mando en la máquina.
+groups_have_admin() {
+    for _g in ${1:-}; do
+        case "$_g" in sudo|wheel|admin) return 0 ;; esac
+    done
+    return 1
+}
+
+# El campo de contraseña de /etc/shadow. Vacío es "sin contraseña"; '!' y '*'
+# son cuenta bloqueada o deshabilitada. Cualquier otra cosa es un hash con el
+# que alguien puede entrar de verdad.
+shadow_hash_is_real() {
+    case "${1:-}" in
+        ''|'!'*|'*'*|x) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# shadow_field FICHERO USUARIO -> campo de contraseña por stdout.
+shadow_field() {
+    [ -r "$1" ] || return 0
+    awk -F: -v u="$2" '$1==u {print $2; exit}' "$1"
+}
+
+# Primera shell que impida iniciar sesión, por stdout.
+nologin_shell() {
+    for _s in /usr/sbin/nologin /sbin/nologin /usr/bin/false /bin/false; do
+        [ -x "$_s" ] && { printf '%s' "$_s"; return 0; }
+    done
+    printf '/bin/false'
+}
+
 gen_password() {
     if [ -r /dev/urandom ]; then
         LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | dd bs=1 count=24 2>/dev/null
@@ -665,7 +708,8 @@ if [ -f "$CONFIG_FILE" ]; then
     eval "$(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=/SAVED_\1=/p' "$CONFIG_FILE")"
     for _k in CF_TOKEN ROOT_DOMAIN ZONE_ID ACCOUNT_ID APP_SUBDOMAIN COOLIFY_SUBDOMAIN \
               NEW_HOSTNAME ADMIN_USER ADMIN_PASSWORD SSH_KEY TIMEZONE TIMEZONE_SOURCE \
-              WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD; do
+              WIFI_SSID WIFI_PASSWORD COOLIFY_EMAIL COOLIFY_PASSWORD \
+              INSTALLER_USER; do
         eval "_cur=\${$_k:-}; _old=\${SAVED_$_k:-}"
         [ -z "$_cur" ] && [ -n "$_old" ] && eval "$_k=\$_old"
     done
@@ -673,6 +717,7 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 
 : "${APP_SUBDOMAIN:=app}"
+: "${INSTALLER_USER:=installer}"
 : "${COOLIFY_SUBDOMAIN:=coolify}"
 
 info "Resolviendo configuración"
@@ -874,6 +919,18 @@ if [ -z "$COOLIFY_EMAIL" ]; then
 fi
 valid_email "$COOLIFY_EMAIL" || die "Email de Coolify no válido: $COOLIFY_EMAIL"
 
+# El nombre acaba en userdel/usermod: se valida antes de acercarlo a nada.
+printf '%s' "$INSTALLER_USER" | grep -Eq '^[A-Za-z_][A-Za-z0-9_.-]*$' \
+    || die "Nombre de cuenta de rescate no válido: $INSTALLER_USER"
+
+if [ -n "$KEEP_RESCUE" ]; then
+    INSTALLER_PLAN="se conserva tal cual (--keep-rescue)"
+elif [ -n "$PURGE_INSTALLER" ]; then
+    INSTALLER_PLAN="se borrará con su home (--purge-installer)"
+else
+    INSTALLER_PLAN="se bloqueará y saldrá de sudo al terminar"
+fi
+
 if [ -z "$COOLIFY_PASSWORD" ]; then
     COOLIFY_PASSWORD=$(gen_password)
     note "Contraseña de Coolify generada (irá al fichero de credenciales)"
@@ -902,6 +959,7 @@ WIFI_SSID='$(printf '%s' "$WIFI_SSID" | sed "s/'/'\\\\''/g")'
 WIFI_PASSWORD='$(printf '%s' "$WIFI_PASSWORD" | sed "s/'/'\\\\''/g")'
 COOLIFY_EMAIL='$COOLIFY_EMAIL'
 COOLIFY_PASSWORD='$(printf '%s' "$COOLIFY_PASSWORD" | sed "s/'/'\\\\''/g")'
+INSTALLER_USER='$INSTALLER_USER'
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -914,6 +972,7 @@ CONFIG_SUMMARY="Configuración resuelta:
   Usuario admin ..... $ADMIN_USER $([ -n "$ADMIN_USER_EXISTED" ] && echo '(ya existe, no se toca)' || echo '(se creará)')
   Zona horaria ...... $TIMEZONE (origen: $TIMEZONE_SOURCE)
   Red ............... $([ -n "$WIFI_SSID" ] && echo "WiFi '$WIFI_SSID'" || echo 'Ethernet/DHCP')
+  Cuenta de rescate . $INSTALLER_USER: $INSTALLER_PLAN
 
   Dominio ........... $ROOT_DOMAIN
   Apps .............. https://$APP_WILDCARD  ->  localhost:80
@@ -1239,6 +1298,104 @@ do_tunnel_service() {
 }
 run_step tunnel_service "Servicio cloudflared" do_tunnel_service
 
+# --- Cuenta de rescate ----------------------------------------------------
+# Va la última a propósito: mientras algo pueda fallar, la cuenta 'installer'
+# es la única vía de entrada garantizada, que es justo para lo que existe.
+#
+# Este paso NUNCA aborta la instalación. Si no puede retirar la cuenta, lo dice
+# y sigue: quedarse sin el fichero de credenciales por culpa de esto sería peor
+# que dejar viva una cuenta de rescate, y el resumen dice siempre cómo quedó.
+INSTALLER_STATE='sin tocar (paso ya completado en un intento anterior)'
+
+# Cierto si con este usuario se puede entrar y mandar. Sin esto no se retira
+# nada: dejaríamos el equipo sin ninguna forma de acceso.
+admin_is_usable() {
+    _au=$1
+    id "$_au" >/dev/null 2>&1 || { warn "El usuario '$_au' no existe."; return 1; }
+    if ! groups_have_admin "$(id -nG "$_au" 2>/dev/null || true)"; then
+        warn "El usuario '$_au' no está en sudo/wheel/admin."
+        return 1
+    fi
+    if shadow_hash_is_real "$(shadow_field /etc/shadow "$_au")"; then
+        return 0
+    fi
+    _ahome=$(getent passwd "$_au" 2>/dev/null | cut -d: -f6 || true)
+    if [ -n "$_ahome" ] && [ -s "$_ahome/.ssh/authorized_keys" ]; then
+        return 0
+    fi
+    warn "El usuario '$_au' no tiene contraseña utilizable ni claves SSH autorizadas."
+    return 1
+}
+
+do_retire_installer() {
+    if [ -n "$KEEP_RESCUE" ]; then
+        INSTALLER_STATE="CONSERVADA por --keep-rescue: sigue con sudo"
+        warn "La cuenta de rescate '$INSTALLER_USER' se conserva tal cual."
+        return 0
+    fi
+    if [ "$OS_N" != linux ]; then
+        INSTALLER_STATE="sin tocar (gestión de usuarios solo automatizada en Linux)"
+        return 0
+    fi
+    if ! id "$INSTALLER_USER" >/dev/null 2>&1; then
+        INSTALLER_STATE="no existe en este equipo"
+        note "No hay ninguna cuenta '$INSTALLER_USER' que retirar."
+        return 0
+    fi
+    if [ "$INSTALLER_USER" = "$ADMIN_USER" ]; then
+        INSTALLER_STATE="CONSERVADA: es también la cuenta de administración"
+        warn "'$INSTALLER_USER' es el usuario administrador; no se retira."
+        return 0
+    fi
+    if [ -z "$IS_ROOT" ]; then
+        INSTALLER_STATE="CONSERVADA: hacía falta root para retirarla"
+        warn "Sin privilegios de root no se puede retirar '$INSTALLER_USER'."
+        return 0
+    fi
+    if ! admin_is_usable "$ADMIN_USER"; then
+        INSTALLER_STATE="CONSERVADA: no se pudo verificar que '$ADMIN_USER' sirva para entrar"
+        warn "La cuenta de rescate '$INSTALLER_USER' sigue viva y con sudo."
+        warn "Comprueba que entras con '$ADMIN_USER' y retírala a mano:"
+        warn "  usermod -L $INSTALLER_USER && usermod -s $(nologin_shell) $INSTALLER_USER"
+        return 0
+    fi
+
+    if [ -n "$PURGE_INSTALLER" ]; then
+        if userdel -r "$INSTALLER_USER" >/dev/null 2>&1; then
+            INSTALLER_STATE="borrada con su home (--purge-installer)"
+            ok "Cuenta de rescate '$INSTALLER_USER' borrada"
+            return 0
+        fi
+        warn "No se pudo borrar '$INSTALLER_USER'; se intenta bloquearla."
+    fi
+
+    _rfail=''
+    usermod -L "$INSTALLER_USER" >/dev/null 2>&1 || _rfail=1
+    for _g in sudo wheel admin; do
+        getent group "$_g" >/dev/null 2>&1 || continue
+        if have gpasswd; then
+            gpasswd -d "$INSTALLER_USER" "$_g" >/dev/null 2>&1 || true
+        elif have deluser; then
+            deluser "$INSTALLER_USER" "$_g" >/dev/null 2>&1 || true
+        fi
+    done
+    groups_have_admin "$(id -nG "$INSTALLER_USER" 2>/dev/null || true)" && _rfail=1
+    # 'usermod -L' solo tacha el hash: no impide entrar con clave SSH, y la
+    # cuenta la crea el autoinstall con 'allow-pw: true' y ssh abierto. La
+    # shell que no deja iniciar sesión es lo que cierra la puerta de verdad.
+    _nsh=$(nologin_shell)
+    usermod -s "$_nsh" "$INSTALLER_USER" >/dev/null 2>&1 || _rfail=1
+    if [ -n "$_rfail" ]; then
+        INSTALLER_STATE="RETIRADA A MEDIAS: revísala a mano"
+        warn "No se pudo retirar del todo '$INSTALLER_USER'. Revísala a mano."
+        return 0
+    fi
+    INSTALLER_STATE="bloqueada, fuera de sudo y con shell $_nsh"
+    ok "Cuenta de rescate '$INSTALLER_USER' retirada"
+    return 0
+}
+run_step retire_installer "Retirada de la cuenta de rescate '$INSTALLER_USER'" do_retire_installer
+
 # ============================================================================
 # FASE 3 — Resumen
 # ============================================================================
@@ -1260,6 +1417,7 @@ write_summaries() {
         printf '  Hostname .......... %s\n' "$NEW_HOSTNAME"
         printf '  Zona horaria ...... %s (origen: %s)\n' "$TIMEZONE" "$TIMEZONE_SOURCE"
         printf '  Usuario admin ..... %s\n' "$ADMIN_USER"
+        printf '  Cuenta de rescate . %s: %s\n' "$INSTALLER_USER" "$INSTALLER_STATE"
         if [ -n "$ADMIN_PASSWORD" ]; then
             printf '  Acceso ............ contraseña generada (en %s)\n' "$CREDS_FILE"
         elif [ -n "$SSH_KEY" ]; then
